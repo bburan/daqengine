@@ -12,17 +12,23 @@ ways. In general, the only portion of the code you should use in third-party
 modules is the `Engine` class. This will serve as the sole communication layer
 between the NI hardware and your application. By doing so, this ensures a
 sufficient layer of abstraction that helps switch between DAQ hardware from
-different vendors (including Measuremnt Computing and OpenElec). This is
+different vendors (including Measurement Computing and OpenElec).
+
+Some parts of the code takes advantage of generators and coroutines. For details
+on this topic, see the following resources:
+
+    http://www.dabeaz.com/coroutines/
+    http://www.python.org/dev/peps/pep-0342/
+
 '''
 
 from __future__ import print_function
 
 from collections import OrderedDict
-from threading import Timer
 import ctypes
 
 import numpy as np
-import PyDAQmx as mx
+#import PyDAQmx as mx
 
 import logging
 log = logging.getLogger(__name__)
@@ -38,7 +44,7 @@ def read_digital_lines(task, size=1):
     nbytes = ctypes.c_int32()
     data = np.empty(nlines.value*size, dtype=np.uint8)
     mx.DAQmxReadDigitalLines(task, size, 0, mx.DAQmx_Val_GroupByChannel, data,
-                                len(data), nsamp, nbytes, None)
+                             len(data), nsamp, nbytes, None)
     return data
 
 
@@ -139,7 +145,7 @@ class ChangeDetectionCallbackHelper(object):
 
     def __init__(self, lines, callback, initial_state, timer_task):
         self._callback = callback
-        self._previous_state = initial_state
+        self._prev_state = initial_state
         self._lines = lines
         self._timer_task = timer_task
 
@@ -158,15 +164,96 @@ class ChangeDetectionCallbackHelper(object):
         try:
             current_state = read_digital_lines(task)
             et = self._get_event_time()
-            for (l, p, c) in zip(self._lines, self._previous_state, current_state):
+            for (l, p, c) in zip(self._lines, self._prev_state, current_state):
                 if p != c:
                     edge = 'rising' if p == 0 else 'falling'
                     self._callback(edge, l, et)
-            self._previous_state = current_state
+            self._prev_state = current_state
             return 0
         except Exception as e:
             log.exception(e)
             return -1
+
+
+def coroutine(func):
+    '''Decorator to auto-start a coroutine.'''
+    def start(*args, **kwargs):
+        cr = func(*args, **kwargs)
+        cr.next()
+        return cr
+    return start
+
+
+@coroutine
+def capture_epoch(uuid, start, duration, callback):
+    '''
+    Coroutine to facilitate epoch acquisition
+    '''
+    accumulated_data = []
+    while True:
+        tlb, data = (yield)
+        samples = data.shape[-1]
+        if start < tlb:
+            # We have missed the start of the epoch. Notify the callback of this
+            # problem.
+            callback(uuid, None)
+            break
+        elif start <= (tlb + samples):
+            # The start of the epoch is somewhere inside `data`. Find the start
+            # `i` and determine how many samples `d` to extract from `data`.
+            # It's possible that data does not contain the entire epoch. In that
+            # case, we just pull out what we can and save it in
+            # `accumulated_data`. We then update start to point to the last
+            # acquired sample `i+d` and update duration to be the number of
+            # samples we still need to capture.
+            i = start-tlb
+            d = min(duration, samples)
+            accumulated_data.append(data[i:i+d])
+            start = i+d
+            duration -= d
+
+            # Check to see if we've finished acquiring the entire epoch. If so,
+            # send it to the callback. Also, do a sanity check on the parameters
+            # (duration < 0 means that something very bad happened).
+            if duration == 0:
+                accumulated_data = np.concatenate(accumulated_data, axis=-1)
+                callback(uuid, accumulated_data)
+                break
+            elif duration < 0:
+                callback(uuid, None)
+                break
+
+
+@coroutine
+def extract_epochs(queue, callback):
+    # The variable `tlb` tracks the number of samples that have been acquired
+    # and reflects the lower bound of `data`. For example, if we have acquired
+    # 300,000 samples, then the next chunk of data received from (yield) will
+    # start at sample 300,000 (remember that Python is zero-based indexing, so
+    # the first sample has an index of 0).
+    tlb = 0
+    epoch_coroutines = []
+    while True:
+        # Wait for new data to become available
+        data = (yield)
+
+        # Check to see if more epochs have been requested
+        while not queue.empty():
+            uuid, start, duration = queue.get()
+            epoch_coroutine = capture_epoch(uuid, start, duration, callback)
+            epoch_coroutines.append(epoch_coroutine)
+
+        # Send the data to each coroutine. If a StopIteration occurs, this means
+        # that the epoch has successfully been acquired and has been sent to the
+        # callback and we can remove it. Need to operate on a copy of list since
+        # it's bad form to modify a list in-place.
+        for epoch_coroutine in epoch_coroutines[:]:
+            try:
+                epoch_coroutine.send((tlb, data))
+            except StopIteration:
+                epoch_coroutines.remove(epoch_coroutine)
+
+        tlb = tlb + data.shape[-1]
 
 
 ################################################################################
@@ -247,7 +334,7 @@ def setup_event_timer(trigger, counter, clock, callback=None, edge='rising'):
         # garbage-collected after this function exits. If the pointer is
         # garbage-collected, then the callback no longer exists and the program
         # will segfault when niDAQmx tries to call it.
-        cb_ptr =  mx.DAQmxSignalEventCallbackPtr(cb)
+        cb_ptr = mx.DAQmxSignalEventCallbackPtr(cb)
         mx.DAQmxRegisterSignalEvent(task, mx.DAQmx_Val_SampleCompleteEvent, 0,
                                     cb_ptr, None)
         task.__se_cb_ptr = cb_ptr
@@ -325,8 +412,7 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples):
     return task
 
 
-def setup_hw_ai(fs, lines, expected_range, callback, callback_samples,
-                        sync_ao):
+def setup_hw_ai(fs, lines, expected_range, callback, callback_samples, sync_ao):
     # Record AI filter delay
     task = create_task()
     lb, ub = expected_range
@@ -381,8 +467,10 @@ class Engine(object):
     input, analog output, digital input, digital output are all unique task
     types).
     '''
-    ao_monitor_period = 1
-    ai_monitor_period = 0.25
+    hw_ao_monitor_period = 1
+    hw_ai_monitor_period = 0.25
+    hw_ai_buffer_duration = 60
+
 
     def __init__(self):
         # Use an OrderedDict to ensure that when we loop through the tasks
@@ -427,12 +515,13 @@ class Engine(object):
             expected range of the signal.
         '''
         task = setup_hw_ao(fs, lines, expected_range, self._samples_needed,
-                           int(self.ao_monitor_period*fs))
+                           int(self.hw_ao_monitor_period*fs))
         self._tasks['hw_ao'] = task
 
     def configure_hw_ai(self, fs, lines, expected_range, sync_ao=True):
         task = setup_hw_ai(fs, lines, expected_range, self._samples_acquired,
-                           int(self.ai_monitor_period*fs), sync_ao)
+                           int(self.hw_ai_monitor_period*fs), sync_ao)
+        task._fs = fs
         self._tasks['hw_ai'] = task
 
     def configure_sw_ao(self, lines, expected_range, names=None,
@@ -492,6 +581,36 @@ class Engine(object):
 
     def register_et_callback(self, callback):
         self._callbacks.setdefault('et', []).append(callback)
+
+    def register_ai_epoch_callback(self, callback, queue):
+        '''
+        Configure epoch-based acquisition. The queue will be used to provide the
+        start time and duration of epochs (in seconds) that should be captured
+        from the analog input signal. The analog input signal is currently
+        buffered with a duration of 60 seconds. This means that if you wait too
+        long to notify the Engine that you want to capture a certain epoch, it
+        may no longer be available in the buffer.
+
+        Parameters
+        ----------
+        queue : {threading, multiprocessing, Queue}.Queue class
+            This queue will provide the epoch start time and duration
+
+        Example
+        -------
+        queue = Queue()
+        engine.register_ai_epoch_callback(save_epoch, queue)
+        ... (some time later)
+        queue.put((1, 0.1))
+        ... (some time later)
+        queue.put((35, 10))
+        '''
+        task = self._tasks['hw_ai']
+        mx.DAQmxGetTaskNumChans(task, self._uint32)
+        buffer_size = (self._uint32.value, int(self.hw_ai_buffer_duration*fs))
+        ring_buffer = np.empty(buffer_size, np.double)
+        generator = extract_epochs(ring_buffer, queue, task, callback)
+        self._callbacks.setdefault('ai_epoch', callback)
 
     def write_hw_ao(self, data, offset=None):
         task = self._tasks['hw_ao']
@@ -645,7 +764,42 @@ def demo_change_detect():
     raw_input('Demo running. Hit enter to exit.\n')
 
 
+def simple_engine_demo():
+    '''
+    This demonstrates the basic Engine interface that we will be using to
+    communicate with the DAQ hardware. A subclass of the Engine will implement
+    NI hardware-specific logic.  Another subclass will implement MCC
+    (TBSI)-specific logic. This enables us to write code that does not care
+    whether it's communicating with a NI or MCC device.
+    '''
+    def ao_callback(samples):
+        print('{} samples generated'.format(samples))
+
+    def ai_callback(samples):
+        print('{} samples acquired'.format(samples.shape))
+
+    def et_callback(change, line, event_time):
+        print('{} edge on {} at {}'.format(change, line, event_time))
+
+    initial_data = np.zeros(1000e3, dtype=np.double)
+    engine = Engine()
+    engine.configure_hw_ai(20e3, '/Dev2/ai0:4', (-10, 10), sync_ao=False)
+    engine.configure_hw_ao(20e3, '/Dev2/ao0', (-10, 10))
+    engine.configure_et('/Dev2/port1/line0:7', 'ao/SampleClock')
+
+    engine.register_ao_callback(ao_callback)
+    engine.register_ai_callback(ai_callback)
+    engine.register_et_callback(et_callback)
+
+    engine.write_hw_ao(initial_data)
+    engine.start()
+    return engine
+
+
 class EngineDemo(object):
+    '''
+    Supporting class for the masker_engine_demo
+    '''
 
     def __init__(self):
         from scipy.io import wavfile
@@ -743,39 +897,11 @@ class EngineDemo(object):
         return np.concatenate(result, axis=-1)
 
 
-def simple_engine_demo():
-    '''
-    This demonstrates the basic Engine interface that we will be using to
-    communicate with the DAQ hardware. A subclass of the Engine will implement
-    NI hardware-specific logic.  Another subclass will implement MCC
-    (TBSI)-specific logic. This enables us to write code that does not care
-    whether it's communicating with a NI or MCC device.
-    '''
-    def ao_callback(samples):
-        print('{} samples generated'.format(samples))
-
-    def ai_callback(samples):
-        print('{} samples acquired'.format(samples.shape))
-
-    def et_callback(change, line, event_time):
-        print('{} edge on {} at {}'.format(change, line, event_time))
-
-    initial_data = np.zeros(1000e3, dtype=np.double)
-    engine = Engine()
-    engine.configure_hw_ai(20e3, '/Dev2/ai0:4', (-10, 10), sync_ao=False)
-    engine.configure_hw_ao(20e3, '/Dev2/ao0', (-10, 10))
-    engine.configure_et('/Dev2/port1/line0:7', 'ao/SampleClock')
-
-    engine.register_ao_callback(ao_callback)
-    engine.register_ai_callback(ai_callback)
-    engine.register_et_callback(et_callback)
-
-    engine.write_hw_ao(initial_data)
-    engine.start()
-    return engine
-
-
 def masker_engine_demo():
+    '''
+    Similar to the original demo code. Demonstrates how one might quickly
+    overwrite samples in the analog output buffer in response to an event.
+    '''
     import pylab as pl
     logging.basicConfig(level='TRACE')
     engine_demo = EngineDemo()
@@ -790,15 +916,43 @@ def masker_engine_demo():
 
 
 def demo_sw():
+    '''
+    Demonstrates the use of software-timed analog outputs and digital outputs.
+    Software-timed outputs change the state (or value) of an output to the new
+    level as soon as requested by the program.
+
+    A common use-case for software-timed digital outputs is to generate a TTL
+    (i.e., a square pulse) to trigger something (e.g., a water pump). I have
+    included convenience functions (`fire_sw_do`) to facilitate this.
+
+    I also have included name aliases. NI-DAQmx refers to the lines using the
+    arcane syntax (e.g., 'Dev2/ao0' or 'Dev2/port0/line0'). However, it is
+    probably easier (and generates more readable programs), if we can assign
+    aliases to these lines. For example, if 'Dev2/ao0' is connected to a
+    Coulbourn shock controller which uses the analog signal to control the
+    intensity of the shock, we may want to call that output 'shock_level'.
+    Likewise, if 'Dev2/port0/line1' is connected to the trigger port of a pellet
+    dispenser, we probably want to call that line 'food_dispense'.
+    '''
     import time
     engine = Engine()
+    # Configure four digital outputs and give them the aliases 'a', 'b', 'c',
+    # and 'd'.
     engine.configure_sw_do('Dev2/port0/line0:3', ['a', 'b', 'c', 'd'],
                            initial_state=[1, 0, 1, 1])
+    # Configure two analog otuputs and give them aliases (i.e., assume ao0
+    # controls shock level and ao1 controls pump rate).
     engine.configure_sw_ao('Dev2/ao0:1', (-10, 10),
                            ['shock_level', 'pump_rate'])
     time.sleep(1)
+
+    # You can connect ao0 to ai0 and use the analog input panel on the MAX test
+    # panels to observe the changes to the analog output.
     engine.set_sw_ao('shock_level', 5)
     engine.set_sw_ao('pump_rate', 4)
+
+     # You can connect the digital lines for port0 to port1 and then monitor the
+     # changes on port1 using the digital panel on the MAX test panels.
     time.sleep(1)
     engine.write_sw_do([0, 0, 0, 0])
     engine.start()
@@ -814,11 +968,44 @@ def demo_sw():
     time.sleep(0.25)
     engine.set_sw_do('c', 0)
     time.sleep(0.25)
+
+    # Generate a TTL pulse of varying duration (in sec).
     engine.fire_sw_do('a', 0.25)
     engine.fire_sw_do('b', 0.5)
     engine.fire_sw_do('c', 1)
     time.sleep(1)
 
+
+class AccumulatorDemo(object):
+
+    def __init__(self):
+        from Queue import Queue
+        from uuid import uuid4
+        queue = Queue()
+        self._accumulated = []
+        extractor = extract_epochs(queue, self.epoch_acquired_cb)
+        uuid = str(uuid4())
+        queue.put((str(uuid4()), 10, 10))
+        queue.put((str(uuid4()), 5, 15))
+        queue.put((str(uuid4()), 300, 25))
+        extractor.send(np.arange(100))
+        queue.put((str(uuid4()), 50, 25))
+        queue.put((str(uuid4()), 150, 13))
+        extractor.send(np.arange(100, 200))
+        extractor.send(np.arange(200, 400))
+        raw_input('Demo running. Press enter to exit.')
+
+    def epoch_acquired_cb(self, uuid, data):
+        if data is None:
+            print('epoch {} was lost'.format(uuid))
+        else:
+            print('epoch {} acquired with shape {}'.format(uuid, data.shape))
+            print(data)
+
+
+################################################################################
+# Test cases
+################################################################################
 
 if __name__ == '__main__':
     #demo_timer()
@@ -826,3 +1013,4 @@ if __name__ == '__main__':
     #demo_sw()
     #simple_engine_demo()
     #masker_engine_demo()
+    AccumulatorDemo()
