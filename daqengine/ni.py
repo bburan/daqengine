@@ -26,9 +26,10 @@ from __future__ import print_function
 
 from collections import OrderedDict
 import ctypes
+from threading import Timer
 
 import numpy as np
-#import PyDAQmx as mx
+import PyDAQmx as mx
 
 import logging
 log = logging.getLogger(__name__)
@@ -56,27 +57,31 @@ def constant_lookup(value):
     raise ValueError('Constant {} does not exist'.format(value))
 
 
-def channel_list(channels, channel_type):
+def channel_info(channels, channel_type):
     task = create_task()
-    if channel_type == 'digital':
+    if channel_type in ('di', 'do', 'digital'):
         mx.DAQmxCreateDIChan(task, channels, '', mx.DAQmx_Val_ChanPerLine)
     elif channel_type == 'ao':
         mx.DAQmxCreateAOVoltageChan(task, channels, '', -10, 10,
                                     mx.DAQmx_Val_Volts, '')
 
-    data = ctypes.create_string_buffer('', 1024)
-    mx.DAQmxGetTaskChannels(task, data, len(data))
+    channels = ctypes.create_string_buffer('', 4096)
+    mx.DAQmxGetTaskChannels(task, channels, len(channels))
+    devices = ctypes.create_string_buffer('', 4096)
+    mx.DAQmxGetTaskDevices(task, devices, len(devices))
     mx.DAQmxClearTask(task)
-    return [c.strip() for c in data.value.split(',')]
+
+    return {
+        'channels': [c.strip() for c in channels.value.split(',')],
+        'devices': [d.strip() for d in devices.value.split(',')],
+    }
+
+def channel_list(channels, channel_type):
+    return channel_info(channels, channel_type)['channels']
 
 
-def get_name_map(lines, names):
-    channels = channel_list(lines, 'digital')
-    if len(channels) != len(names):
-        m = 'Number of names must match number of lines'
-        raise ValueError(m)
-    return dict(zip(channels, names))
-
+def device_list(channels, channel_type):
+    return channel_info(channels, channel_type)['devices']
 
 class CallbackHelper(object):
 
@@ -419,7 +424,7 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples):
                              mx.DAQmx_Val_ContSamps, int(fs))
 
     # This controls how quickly we can update the buffer on the device.
-    mx.DAQmxSetBufOutputOnbrdBufSize(task, 100)
+    mx.DAQmxSetBufOutputOnbrdBufSize(task, 8191)
 
     # If the write reaches the end of the buffer and no new data has been
     # provided, do not loop around to the beginning and start over.
@@ -587,11 +592,43 @@ class Engine(object):
         self.write_sw_do(initial_state)
 
     def configure_et(self, lines, clock, names=None):
-        # TODO - We need to make this a bit smarter about which device we're
-        # using. It shoudln't hard-code the device (or the counter in case we
-        # want to use a different counter).
-        et_task = setup_event_timer('/Dev2/ChangeDetectionEvent', '/Dev2/Ctr0',
-                                    clock)
+        '''
+        Setup change detection with high-precision timestamps
+
+        Anytime a rising or falling edge is detected on one of the specified
+        lines, a timestamp based on the specified clock will be captured. For
+        example, if the clock is 'ao/SampleClock', then the timestamp will be
+        the number of samples played at the point when the line changed state.
+
+        Parameters
+        ----------
+        lines : string
+            Digital lines (in NI-DAQmx syntax, e.g., 'Dev2/port0/line0:4') to
+            monitor.
+        clock : string
+            Reference clock from which timestamps will be drawn.
+        names : string (optional)
+            Aliases for the lines. When aliases are provided, registered
+            callbacks will receive the alias for the line instead of the
+            NI-DAQmx notation.
+
+        Notes
+        -----
+        Be aware of the limitations of your device. All X-series devices support
+        change detection on all ports; however, only some M-series devices do
+        (and then, only on port 0).
+        '''
+        # Find out which device the lines are from. Use this to configure the
+        # event timer. Right now we don't want to deal with multi-device event
+        # timers. If there's more than one device, then we should configure each
+        # separately.
+        devices = device_list(lines, 'digital')
+        if len(devices) != 1:
+            raise ValueError('Cannot configure multi-device event timer')
+
+        trigger = '/{}/ChangeDetectionEvent'.format(devices[0])
+        counter = '/{}/Ctr0'.format(devices[0])
+        et_task = setup_event_timer(trigger, counter, clock)
         cd_task = setup_change_detect_callback(lines, self._et_fired, et_task,
                                                names)
         self._tasks['et_task'] = et_task
@@ -742,7 +779,7 @@ class Engine(object):
 ################################################################################
 # demo
 ################################################################################
-def demo_timer():
+def demo_timer(device='Dev2'):
     '''
     Demonstrates accurate timestamp detection of rising and falling edges on
     PFI1 and PFI2.  To test this, use the Dev2 Test Panels (via the Measurement
@@ -784,11 +821,11 @@ def demo_change_detect():
     def callback(edge, line, event_time):
         print('{} edge on {} at {}'.format(edge, line, event_time/10e6))
 
-    timer_task = setup_event_timer('/Dev2/ChangeDetectionEvent', '/Dev2/Ctr3',
+    timer_task = setup_event_timer('/Dev2/ChangeDetectionEvent', '/Dev2/Ctr0',
                                    '/Dev2/10MhzRefClock')
-    cd_task = setup_change_detect_callback('/Dev2/port1/line1:2', callback,
+    cd_task = setup_change_detect_callback('/Dev2/port0/line0:2', callback,
                                            timer=timer_task,
-                                           names=['spout', 'lick'])
+                                           names=['spout', 'lick', 'poke'])
     mx.DAQmxStartTask(timer_task)
     mx.DAQmxStartTask(cd_task)
     raw_input('Demo running. Hit enter to exit.\n')
@@ -816,13 +853,13 @@ def simple_engine_demo():
               .format(uuid, samples.shape))
 
     import Queue
-    epoch_queue = Queue.Queue()
+    queue = Queue.Queue()
 
     initial_data = np.zeros(1000e3, dtype=np.double)
     engine = Engine()
     engine.configure_hw_ai(20e3, '/Dev2/ai0:4', (-10, 10), sync_ao=False)
     engine.configure_hw_ao(20e3, '/Dev2/ao0', (-10, 10))
-    engine.configure_et('/Dev2/port1/line0:7', 'ao/SampleClock')
+    engine.configure_et('/Dev2/port0/line0:7', 'ao/SampleClock')
 
     engine.register_ao_callback(ao_callback)
     engine.register_ai_callback(ai_callback)
@@ -834,6 +871,7 @@ def simple_engine_demo():
 
     engine.write_hw_ao(initial_data)
     engine.start()
+    raw_input('Demo running. Hit enter to exit.\n')
     return engine
 
 
@@ -1063,6 +1101,6 @@ if __name__ == '__main__':
     #demo_timer()
     #demo_change_detect()
     #demo_sw()
-    #simple_engine_demo()
+    simple_engine_demo()
     #masker_engine_demo()
-    AccumulatorDemo()
+    #AccumulatorDemo()
