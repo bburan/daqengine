@@ -207,14 +207,14 @@ def capture_epoch(uuid, start, duration, callback):
             # acquired sample `i+d` and update duration to be the number of
             # samples we still need to capture.
             i = start-tlb
-            d = min(duration, samples)
+            d = min(duration, samples-i)
             accumulated_data.append(data[i:i+d])
-            start = i+d
+            start = start+d
             duration -= d
 
             # Check to see if we've finished acquiring the entire epoch. If so,
             # send it to the callback. Also, do a sanity check on the parameters
-            # (duration < 0 means that something very bad happened).
+            # (duration < 0 means that something happened and we can't recover.
             if duration == 0:
                 accumulated_data = np.concatenate(accumulated_data, axis=-1)
                 callback(uuid, accumulated_data)
@@ -225,7 +225,14 @@ def capture_epoch(uuid, start, duration, callback):
 
 
 @coroutine
-def extract_epochs(queue, callback):
+def extract_epochs(queue, callback, buffer_samples):
+    '''
+    Parameters
+    ----------
+    queue
+    callback
+    buffer_samples
+    '''
     # The variable `tlb` tracks the number of samples that have been acquired
     # and reflects the lower bound of `data`. For example, if we have acquired
     # 300,000 samples, then the next chunk of data received from (yield) will
@@ -233,6 +240,8 @@ def extract_epochs(queue, callback):
     # the first sample has an index of 0).
     tlb = 0
     epoch_coroutines = []
+    prior_samples = []
+
     while True:
         # Wait for new data to become available
         data = (yield)
@@ -241,7 +250,14 @@ def extract_epochs(queue, callback):
         while not queue.empty():
             uuid, start, duration = queue.get()
             epoch_coroutine = capture_epoch(uuid, start, duration, callback)
+            # Go through the data we've been caching to facilitate historical
+            # acquisition of data.
             epoch_coroutines.append(epoch_coroutine)
+            for prior_sample in prior_samples:
+                try:
+                    epoch_coroutine.send(prior_sample)
+                except StopIteration:
+                    epoch_coroutines.remove(epoch_coroutine)
 
         # Send the data to each coroutine. If a StopIteration occurs, this means
         # that the epoch has successfully been acquired and has been sent to the
@@ -253,7 +269,17 @@ def extract_epochs(queue, callback):
             except StopIteration:
                 epoch_coroutines.remove(epoch_coroutine)
 
+        prior_samples.append((tlb, data))
         tlb = tlb + data.shape[-1]
+
+        # Check to see if any of the cached samples are older than the specified
+        # `buffer_samples`.
+        while True:
+            tub = prior_samples[0][0] + prior_samples[0][1].shape[-1]
+            if tub < (tlb-buffer_samples):
+                prior_samples.pop(0)
+            else:
+                break
 
 
 ################################################################################
@@ -469,8 +495,6 @@ class Engine(object):
     '''
     hw_ao_monitor_period = 1
     hw_ai_monitor_period = 0.25
-    hw_ai_buffer_duration = 60
-
 
     def __init__(self):
         # Use an OrderedDict to ensure that when we loop through the tasks
@@ -582,19 +606,25 @@ class Engine(object):
     def register_et_callback(self, callback):
         self._callbacks.setdefault('et', []).append(callback)
 
-    def register_ai_epoch_callback(self, callback, queue):
+    def register_ai_epoch_callback(self, callback, queue, buffer_size=60):
         '''
         Configure epoch-based acquisition. The queue will be used to provide the
         start time and duration of epochs (in seconds) that should be captured
-        from the analog input signal. The analog input signal is currently
-        buffered with a duration of 60 seconds. This means that if you wait too
-        long to notify the Engine that you want to capture a certain epoch, it
-        may no longer be available in the buffer.
+        from the analog input signal. The analog input signal can be buffered,
+        allowing you to retroactively request an epoch that was already
+        acquired.  However, the buffer will be a fixed duration, so if you wait
+        too long to notify the Engine that you want to capture a certain epoch,
+        it may no longer be available in the buffer.
 
         Parameters
         ----------
+        callback : callable
+            Function to be called when the entire epoch is acquired. The
+            function will receive the uuid and epoch data.
         queue : {threading, multiprocessing, Queue}.Queue class
             This queue will provide the epoch start time and duration
+        buffer_size : float
+            Buffer size in seconds
 
         Example
         -------
@@ -606,11 +636,9 @@ class Engine(object):
         queue.put((35, 10))
         '''
         task = self._tasks['hw_ai']
-        mx.DAQmxGetTaskNumChans(task, self._uint32)
-        buffer_size = (self._uint32.value, int(self.hw_ai_buffer_duration*fs))
-        ring_buffer = np.empty(buffer_size, np.double)
-        generator = extract_epochs(ring_buffer, queue, task, callback)
-        self._callbacks.setdefault('ai_epoch', callback)
+        buffer_samples = int(buffer_size*task._fs)
+        generator = extract_epochs(queue, callback, buffer_samples)
+        self._callbacks.setdefault('ai_epoch', generator)
 
     def write_hw_ao(self, data, offset=None):
         task = self._tasks['hw_ao']
@@ -677,6 +705,8 @@ class Engine(object):
     def _samples_acquired(self, samples):
         for cb in self._callbacks.get('ai', []):
             cb(samples)
+        for generator in self._callbacks.get('ai_epoch', generator):
+            generator.send(samples)
 
     def _samples_needed(self, samples):
         for cb in self._callbacks.get('ao', []):
@@ -781,6 +811,13 @@ def simple_engine_demo():
     def et_callback(change, line, event_time):
         print('{} edge on {} at {}'.format(change, line, event_time))
 
+    def ai_epoch_callback(uuid, samples):
+        print('Epoch UUID {} acquired with {} samples' \
+              .format(uuid, samples.shape))
+
+    import Queue
+    epoch_queue = Queue.Queue()
+
     initial_data = np.zeros(1000e3, dtype=np.double)
     engine = Engine()
     engine.configure_hw_ai(20e3, '/Dev2/ai0:4', (-10, 10), sync_ao=False)
@@ -790,6 +827,10 @@ def simple_engine_demo():
     engine.register_ao_callback(ao_callback)
     engine.register_ai_callback(ai_callback)
     engine.register_et_callback(et_callback)
+    engine.register_ai_epoch_callback(queue, ai_epoch_callback)
+    queue.put(('epoch 1', 0, 100))
+    queue.put(('epoch 2', 15, 100))
+    queue.put(('epoch 3', 55, 100))
 
     engine.write_hw_ao(initial_data)
     engine.start()
@@ -977,22 +1018,33 @@ def demo_sw():
 
 
 class AccumulatorDemo(object):
+    # TODO - make this a unittest
 
     def __init__(self):
         from Queue import Queue
         from uuid import uuid4
         queue = Queue()
         self._accumulated = []
-        extractor = extract_epochs(queue, self.epoch_acquired_cb)
-        uuid = str(uuid4())
-        queue.put((str(uuid4()), 10, 10))
-        queue.put((str(uuid4()), 5, 15))
-        queue.put((str(uuid4()), 300, 25))
+        extractor = extract_epochs(queue, self.epoch_acquired_cb, 100)
+        queue.put(('epoch 1', 10, 10))
+        queue.put(('epoch 2', 5, 15))
+        queue.put(('epoch 3', 300, 25))
         extractor.send(np.arange(100))
-        queue.put((str(uuid4()), 50, 25))
-        queue.put((str(uuid4()), 150, 13))
+        queue.put(('epoch 4', 50, 25))
+        queue.put(('epoch 5', 150, 13))
         extractor.send(np.arange(100, 200))
         extractor.send(np.arange(200, 400))
+        queue.put(('epoch 6', 0, 100))       # will be lost
+        queue.put(('epoch 7', 300, 25))      # will be drawn from buffer
+        queue.put(('epoch 8', 350, 100))     # will be drawn from buffer plus
+                                             #  next acquisition
+        queue.put(('epoch 9', 350, 125))     # will be drawn from buffer plus
+                                             #  next two acquisitions
+        queue.put(('epoch10', 350, 150))     # will be drawn from buffer plus
+                                             #  next three acquisitions
+        extractor.send(np.arange(400, 450))
+        extractor.send(np.arange(450, 475))
+        extractor.send(np.arange(475, 500))
         raw_input('Demo running. Press enter to exit.')
 
     def epoch_acquired_cb(self, uuid, data):
