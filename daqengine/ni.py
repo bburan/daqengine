@@ -76,12 +76,14 @@ def channel_info(channels, channel_type):
         'devices': [d.strip() for d in devices.value.split(',')],
     }
 
+
 def channel_list(channels, channel_type):
     return channel_info(channels, channel_type)['channels']
 
 
 def device_list(channels, channel_type):
     return channel_info(channels, channel_type)['devices']
+
 
 class CallbackHelper(object):
 
@@ -190,18 +192,22 @@ def coroutine(func):
 
 
 @coroutine
-def capture_epoch(uuid, start, duration, callback):
+def capture_epoch(start, duration, callback):
     '''
     Coroutine to facilitate epoch acquisition
     '''
+    # This coroutine will continue until it acquires all the samples it needs.
+    # It then provides the samples to the callback function and exits the while
+    # loop.
     accumulated_data = []
     while True:
         tlb, data = (yield)
         samples = data.shape[-1]
         if start < tlb:
             # We have missed the start of the epoch. Notify the callback of this
-            # problem.
-            callback(uuid, None)
+            log.debug('Missed samples for epoch of %d samples starting at %d',
+                      start, duration)
+            callback(start, duration, None)
             break
         elif start <= (tlb + samples):
             # The start of the epoch is somewhere inside `data`. Find the start
@@ -213,7 +219,7 @@ def capture_epoch(uuid, start, duration, callback):
             # samples we still need to capture.
             i = start-tlb
             d = min(duration, samples-i)
-            accumulated_data.append(data[i:i+d])
+            accumulated_data.append(data[..., i:i+d])
             start = start+d
             duration -= d
 
@@ -222,10 +228,12 @@ def capture_epoch(uuid, start, duration, callback):
             # (duration < 0 means that something happened and we can't recover.
             if duration == 0:
                 accumulated_data = np.concatenate(accumulated_data, axis=-1)
-                callback(uuid, accumulated_data)
+                callback(start, duration, accumulated_data)
                 break
             elif duration < 0:
-                callback(uuid, None)
+                log.debug('Acquired too many samples for epoch of %d samples '
+                          'starting at %d', start, duration)
+                callback(start, duration, None)
                 break
 
 
@@ -251,10 +259,11 @@ def extract_epochs(queue, callback, buffer_samples):
         # Wait for new data to become available
         data = (yield)
 
-        # Check to see if more epochs have been requested
+        # Check to see if more epochs have been requested. Information will be
+        # provided in seconds, but we need to convert this to number of samples.
         while not queue.empty():
-            uuid, start, duration = queue.get()
-            epoch_coroutine = capture_epoch(uuid, start, duration, callback)
+            start, duration = queue.get()
+            epoch_coroutine = capture_epoch(start, duration, callback)
             # Go through the data we've been caching to facilitate historical
             # acquisition of data.
             epoch_coroutines.append(epoch_coroutine)
@@ -354,7 +363,7 @@ def setup_event_timer(trigger, counter, clock, callback=None, edge='rising'):
     mx.DAQmxCreateCICountEdgesChan(task, counter, '', mx.DAQmx_Val_Rising, 0,
                                    mx.DAQmx_Val_CountUp)
     mx.DAQmxSetCICountEdgesTerm(task, counter, clock)
-    mx.DAQmxCfgSampClkTiming(task, trigger, 1, edge_value,
+    mx.DAQmxCfgSampClkTiming(task, trigger, 200e3, edge_value,
                              mx.DAQmx_Val_ContSamps, 500)
 
     if callback is not None:
@@ -423,12 +432,17 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples):
     mx.DAQmxCfgSampClkTiming(task, '', fs, mx.DAQmx_Val_Rising,
                              mx.DAQmx_Val_ContSamps, int(fs))
 
-    # This controls how quickly we can update the buffer on the device.
+    # This controls how quickly we can update the buffer on the device. On some
+    # devices it is not user-settable. On the X-series PCIe-6321 I am able to
+    # change it. On the M-xeries PCI 6259 it appears to be fixed at 8191
+    # samples.
     mx.DAQmxSetBufOutputOnbrdBufSize(task, 8191)
 
     # If the write reaches the end of the buffer and no new data has been
     # provided, do not loop around to the beginning and start over.
     mx.DAQmxSetWriteRegenMode(task, mx.DAQmx_Val_DoNotAllowRegen)
+
+    mx.DAQmxSetBufOutputBufSize(task, int(callback_samples*100))
 
     result = ctypes.c_uint32()
     mx.DAQmxGetTaskNumChans(task, result)
@@ -461,13 +475,23 @@ def setup_hw_ai(fs, lines, expected_range, callback, callback_samples, sync_ao):
                                  mx.DAQmx_Val_ContSamps, int(fs))
 
     result = ctypes.c_uint32()
+    mx.DAQmxGetBufInputBufSize(task, result)
+    buffer_size = result.value
     mx.DAQmxGetTaskNumChans(task, result)
     n_channels = result.value
+
+    log.debug('Buffer size for %s automatically allocated as %d samples',
+              lines, buffer_size)
+    log.debug('%d channels in task', n_channels)
+
+    new_buffer_size = np.ceil(buffer_size/callback_samples)*callback_samples
+    mx.DAQmxSetBufInputBufSize(task, int(new_buffer_size))
 
     callback_helper = SamplesAcquiredCallbackHelper(callback, n_channels)
     cb_ptr = mx.DAQmxEveryNSamplesEventCallbackPtr(callback_helper)
     mx.DAQmxRegisterEveryNSamplesEvent(task, mx.DAQmx_Val_Acquired_Into_Buffer,
                                        int(callback_samples), 0, cb_ptr, None)
+
     task._cb_ptr = cb_ptr
     return task
 
@@ -498,8 +522,39 @@ class Engine(object):
     input, analog output, digital input, digital output are all unique task
     types).
     '''
+    # Poll period (in seconds). This defines how often callbacks for the analog
+    # outputs are notified (i.e., to generate additional samples for playout).
+    # If the poll period is too long, then the analog output may run out of
+    # samples.
     hw_ao_monitor_period = 1
+
+    # Poll period (in seconds). This defines how quickly acquired (analog input)
+    # data is downloaded from the buffers (and made available to listeners). If
+    # you want to see data as soon as possible, set the poll period to a small
+    # value. If your application is stalling or freezing, set this to a larger
+    # value.
     hw_ai_monitor_period = 0.25
+
+    # Even though data is written to the analog outputs, it is buffered in
+    # computer memory until it's time to be transferred to the onboard buffer of
+    # the NI acquisition card. NI-DAQmx handles this behind the scenes (i.e.,
+    # when the acquisition card needs additional samples, NI-DAQmx will transfer
+    # the next chunk of data from the computer memory). We can overwrite data
+    # that's been buffered in computer memory (e.g., so we can insert a target
+    # in response to a nose-poke). However, we cannot overwrite data that's
+    # already been transfered to the onboard buffer. So, the onboard buffer size
+    # determines how quickly we can change the analog output in response to an
+    # event.
+    hw_ao_onboard_buffer = 8191
+
+    # Since any function call takes a small fraction of time (e.g., nanoseconds
+    # to milliseconds), we can't simply overwrite data starting at
+    # hw_ao_onboard_buffer+1. By the time the function calls are complete, the
+    # DAQ probably has already transferred a couple hundred samples to the
+    # buffer. This parameter will likely need some tweaking (i.e., only you can
+    # determine an appropriate value for this based on the needs of your
+    # program).
+    hw_ao_min_writeahead = hw_ao_onboard_buffer + 1000
 
     def __init__(self):
         # Use an OrderedDict to ensure that when we loop through the tasks
@@ -675,7 +730,7 @@ class Engine(object):
         task = self._tasks['hw_ai']
         buffer_samples = int(buffer_size*task._fs)
         generator = extract_epochs(queue, callback, buffer_samples)
-        self._callbacks.setdefault('ai_epoch', generator)
+        self._callbacks.setdefault('ai_epoch', []).append(generator)
 
     def write_hw_ao(self, data, offset=None):
         task = self._tasks['hw_ao']
@@ -742,7 +797,7 @@ class Engine(object):
     def _samples_acquired(self, samples):
         for cb in self._callbacks.get('ai', []):
             cb(samples)
-        for generator in self._callbacks.get('ai_epoch', generator):
+        for generator in self._callbacks.get('ai_epoch', []):
             generator.send(samples)
 
     def _samples_needed(self, samples):
@@ -763,12 +818,14 @@ class Engine(object):
     def ao_write_space_available(self, offset=None):
         try:
             task = self._tasks['hw_ao']
+            mx.DAQmxGetWriteCurrWritePos(task, self._uint64)
+            log.trace('Current write position %d', self._uint64.value)
             if offset is not None:
                 mx.DAQmxSetWriteRelativeTo(task, mx.DAQmx_Val_FirstSample)
                 mx.DAQmxSetWriteOffset(task, offset)
             else:
                 mx.DAQmxSetWriteRelativeTo(task, mx.DAQmx_Val_CurrWritePos)
-                mx.DAQmxSetWriteOffset(task, 0)
+                mx.DAQmxSetWriteOffset(task, -1000)
             mx.DAQmxGetWriteSpaceAvail(task, self._uint32)
             log.trace('Current write space available %d', self._uint32.value)
             return self._uint32.value
@@ -847,10 +904,10 @@ def simple_engine_demo():
 
     def et_callback(change, line, event_time):
         print('{} edge on {} at {}'.format(change, line, event_time))
+        queue.put((event_time-100, 100))
 
-    def ai_epoch_callback(uuid, samples):
-        print('Epoch UUID {} acquired with {} samples' \
-              .format(uuid, samples.shape))
+    def ai_epoch_callback(start, duration, samples):
+        print('Epoch {} acquired with {} samples'.format(start, samples.shape))
 
     import Queue
     queue = Queue.Queue()
@@ -864,10 +921,10 @@ def simple_engine_demo():
     engine.register_ao_callback(ao_callback)
     engine.register_ai_callback(ai_callback)
     engine.register_et_callback(et_callback)
-    engine.register_ai_epoch_callback(queue, ai_epoch_callback)
-    queue.put(('epoch 1', 0, 100))
-    queue.put(('epoch 2', 15, 100))
-    queue.put(('epoch 3', 55, 100))
+    engine.register_ai_epoch_callback(ai_epoch_callback, queue)
+    queue.put((0, 100))
+    queue.put((15, 100))
+    queue.put((55, 100))
 
     engine.write_hw_ao(initial_data)
     engine.start()
@@ -908,7 +965,7 @@ class EngineDemo(object):
         # How soon after the "trigger" (i.e., the decision to start a trial)
         # should the target be inserted? This needs to give Neurobehavior
         # sufficient time to generate the waveform and overwrite the buffer.
-        self.update_delay = int(self.fs*0.05)
+        self.update_delay = int(self.fs*0.25)
 
         # How often should we add new masker data to the buffer?
         self.update_interval = int(self.fs*1)
@@ -921,7 +978,8 @@ class EngineDemo(object):
         self.engine = Engine()
         self.engine.configure_hw_ai(self.fs, 'Dev2/ai0', (-10, 10))
         self.engine.configure_hw_ao(self.fs, 'Dev2/ao0', (-10, 10))
-        self.engine.configure_et('Dev2/PFI1', 'ao/SampleClock')
+        self.engine.configure_et('/Dev2/port0/line0', 'ao/SampleClock',
+                                 names=['trigger'])
         self.engine.write_hw_ao(self.masker)
 
         self.engine.register_ao_callback(self.samples_needed)
@@ -931,17 +989,17 @@ class EngineDemo(object):
         self.engine.start()
 
     def et_fired(self, edge, line, timestamp):
-        if edge == 'rising' and line == 'Dev2/PFI1':
+        if edge == 'rising' and line == 'trigger':
             log.debug('Detected trigger at %d', timestamp)
             self._event_times.append(timestamp)
-
             offset = int(timestamp) + self.update_delay
             log.debug('Inserting target at %d', offset)
-            duration = self.engine.ao_write_space_available(offset)
+            duration = self.engine.ao_write_space_available(offset)/2
             log.debug('Overwriting %d samples in buffer', duration)
             result = self._get_masker(offset, duration)
             result[:self.T01.shape[-1]] += self.T01*0.1
             self.engine.write_hw_ao(result, offset)
+            self.engine.write_hw_ao(result)
             self._masker_offset = offset + result.shape[-1]
 
     def samples_acquired(self, samples):
@@ -966,7 +1024,6 @@ class EngineDemo(object):
                 subset = self.masker[offset:offset+duration]
                 duration = 0
             else:
-                log.trace('Wrapping to beginning of masker')
                 subset = self.masker[offset:]
                 offset = 0
                 duration = duration-subset.shape[-1]
@@ -982,7 +1039,7 @@ def masker_engine_demo():
     overwrite samples in the analog output buffer in response to an event.
     '''
     import pylab as pl
-    logging.basicConfig(level='TRACE')
+    import time
     engine_demo = EngineDemo()
     raw_input('Demo running. Hit enter to exit.\n')
     engine_demo.engine.stop()
@@ -1064,33 +1121,97 @@ class AccumulatorDemo(object):
         queue = Queue()
         self._accumulated = []
         extractor = extract_epochs(queue, self.epoch_acquired_cb, 100)
-        queue.put(('epoch 1', 10, 10))
-        queue.put(('epoch 2', 5, 15))
-        queue.put(('epoch 3', 300, 25))
+        queue.put((10, 10))
+        queue.put((5, 15))
+        queue.put((300, 25))
         extractor.send(np.arange(100))
-        queue.put(('epoch 4', 50, 25))
-        queue.put(('epoch 5', 150, 13))
+        queue.put((50, 25))
+        queue.put((150, 13))
         extractor.send(np.arange(100, 200))
         extractor.send(np.arange(200, 400))
-        queue.put(('epoch 6', 0, 100))       # will be lost
-        queue.put(('epoch 7', 300, 25))      # will be drawn from buffer
-        queue.put(('epoch 8', 350, 100))     # will be drawn from buffer plus
+        queue.put((0, 100))       # will be lost
+        queue.put((300, 25))      # will be drawn from buffer
+        queue.put((350, 100))     # will be drawn from buffer plus
                                              #  next acquisition
-        queue.put(('epoch 9', 350, 125))     # will be drawn from buffer plus
+        queue.put((350, 125))     # will be drawn from buffer plus
                                              #  next two acquisitions
-        queue.put(('epoch10', 350, 150))     # will be drawn from buffer plus
+        queue.put((350, 150))     # will be drawn from buffer plus
                                              #  next three acquisitions
         extractor.send(np.arange(400, 450))
         extractor.send(np.arange(450, 475))
         extractor.send(np.arange(475, 500))
         raw_input('Demo running. Press enter to exit.')
 
-    def epoch_acquired_cb(self, uuid, data):
+    def epoch_acquired_cb(self, start, duration, data):
         if data is None:
-            print('epoch {} was lost'.format(uuid))
+            print('epoch {} was lost'.format(start))
         else:
-            print('epoch {} acquired with shape {}'.format(uuid, data.shape))
+            print('epoch {} acquired with shape {}'.format(start, data.shape))
             print(data)
+
+
+def test_write():
+    import pylab as pl
+
+    class WriteTest(object):
+
+        def __init__(self):
+            self.ai_task = setup_hw_ai(25e3, '/Dev2/ai0', (-10, 10),
+                                       self.ai_callback, 2500, sync_ao=True)
+            self.ao_task = setup_hw_ao(25e3, '/Dev2/ao0', (-10, 10),
+                                       self.ao_callback, 10000)
+            self.acquired = []
+            self.ao_callback(10000, 1)
+            mx.DAQmxStartTask(self.ai_task)
+            mx.DAQmxStartTask(self.ao_task)
+            result = ctypes.c_int32()
+            self.ao_callback(2500, 0.5)
+
+            mx.DAQmxSetWriteRelativeTo(self.ao_task, mx.DAQmx_Val_FirstSample)
+            mx.DAQmxSetWriteOffset(self.ao_task, 10000+2500-1250)
+            self.ao_callback(2500, 0)
+
+            result = ctypes.c_uint64()
+            mx.DAQmxGetWriteCurrWritePos(self.ao_task, result)
+            written = result.value
+
+            result = ctypes.c_uint64()
+            mx.DAQmxGetWriteTotalSampPerChanGenerated(self.ao_task, result)
+            generated = result.value
+
+            print('Current generate position', result.value)
+            print('Current write position', written)
+
+            mx.DAQmxSetWriteRelativeTo(self.ao_task, mx.DAQmx_Val_FirstSample)
+            #mx.DAQmxSetWriteOffset(self.ao_task, written-5000)
+            mx.DAQmxSetWriteOffset(self.ao_task, generated+8300)
+            self.ao_callback(2500, -1)
+
+        def ao_callback(self, samples, sf=2):
+            try:
+                result = ctypes.c_uint64()
+                mx.DAQmxGetWriteCurrWritePos(self.ao_task, result)
+                print('Current write position', result.value)
+                mx.DAQmxGetWriteSpaceAvail(self.ao_task, result)
+                print('Current write space available', result.value)
+            except:
+                pass
+
+            result = ctypes.c_int32()
+            data = np.ones(samples)*sf
+            mx.DAQmxWriteAnalogF64(self.ao_task, data.shape[-1], False, 0,
+                                   mx.DAQmx_Val_GroupByChannel, data, result,
+                                   None)
+
+        def ai_callback(self, samples):
+            self.acquired.append(samples)
+
+    test = WriteTest()
+    raw_input('ready')
+    mx.DAQmxStopTask(test.ao_task)
+    acquired = np.concatenate(test.acquired, axis=-1)
+    pl.plot(acquired.T)
+    pl.show()
 
 
 ################################################################################
@@ -1098,9 +1219,11 @@ class AccumulatorDemo(object):
 ################################################################################
 
 if __name__ == '__main__':
-    #demo_timer()
+    logging.basicConfig(level='TRACE')
+    demo_timer()
     #demo_change_detect()
     #demo_sw()
-    simple_engine_demo()
+    #simple_engine_demo()
     #masker_engine_demo()
     #AccumulatorDemo()
+    #test_write()
