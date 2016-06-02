@@ -832,6 +832,11 @@ class Engine(object):
         except KeyError:
             raise SystemError('No hardware-timed AO task configured')
 
+    def ao_sample_clock(self):
+        task = self._tasks['hw_ao']
+        mx.DAQmxGetWriteTotalSampPerChanGenerated(task, self._uint64)
+        return self._uint64.value
+
 
 ################################################################################
 # demo
