@@ -496,11 +496,14 @@ def setup_change_detect_callback(lines, callback, timer, names=None):
     return task
 
 
-def setup_hw_ao(fs, lines, expected_range, callback, callback_samples):
+def setup_hw_ao(fs, lines, expected_range, callback, callback_samples,
+                trigger=None):
     # TODO: DAQmxSetAOTermCfg
     task = create_task()
     lb, ub = expected_range
     mx.DAQmxCreateAOVoltageChan(task, lines, '', lb, ub, mx.DAQmx_Val_Volts, '')
+    if trigger is not None:
+        mx.DAQmxCfgDigEdgeStartTrig(task, trigger, mx.DAQmx_Val_Rising)
     mx.DAQmxCfgSampClkTiming(task, '', fs, mx.DAQmx_Val_Rising,
                              mx.DAQmx_Val_ContSamps, int(fs))
 
@@ -529,21 +532,18 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples):
     return task
 
 
-def setup_hw_ai(fs, lines, expected_range, callback, callback_samples, sync_ao):
+def setup_hw_ai(fs, lines, expected_range, callback, callback_samples,
+                trigger=None):
     # Record AI filter delay
     task = create_task()
     lb, ub = expected_range
     mx.DAQmxCreateAIVoltageChan(task, lines, '', mx.DAQmx_Val_RSE, lb, ub,
                                 mx.DAQmx_Val_Volts, '')
-    if sync_ao:
-        mx.DAQmxCfgDigEdgeStartTrig(task, 'ao/StartTrigger',
-                                    mx.DAQmx_Val_Rising)
-        mx.DAQmxCfgSampClkTiming(task, 'ao/SampleClock', fs,
-                                 mx.DAQmx_Val_Rising, mx.DAQmx_Val_ContSamps,
-                                 int(fs))
-    else:
-        mx.DAQmxCfgSampClkTiming(task, '', fs, mx.DAQmx_Val_Rising,
-                                 mx.DAQmx_Val_ContSamps, int(fs))
+    if trigger is not None:
+        mx.DAQmxCfgDigEdgeStartTrig(task, trigger, mx.DAQmx_Val_Rising)
+
+    mx.DAQmxCfgSampClkTiming(task, '', fs, mx.DAQmx_Val_Rising,
+                             mx.DAQmx_Val_ContSamps, int(fs))
 
     result = ctypes.c_uint32()
     mx.DAQmxGetBufInputBufSize(task, result)
@@ -563,11 +563,18 @@ def setup_hw_ai(fs, lines, expected_range, callback, callback_samples, sync_ao):
     mx.DAQmxRegisterEveryNSamplesEvent(task, mx.DAQmx_Val_Acquired_Into_Buffer,
                                        int(callback_samples), 0, cb_ptr, None)
 
+    mx.DAQmxTaskControl(task, mx.DAQmx_Val_Task_Commit)
+    rate = ctypes.c_double()
+    mx.DAQmxGetSampClkRate(task, rate)
+    log.debug('AI sample rate'.format(rate.value))
+    mx.DAQmxGetSampClkTimebaseRate(task, rate)
+    log.debug('AI timebase {}'.format(rate.value))
     task._cb_ptr = cb_ptr
     return task
 
 
-def setup_hw_di(fs, lines, callback, callback_samples, clock=None):
+def setup_hw_di(fs, lines, callback, callback_samples, clock=None,
+                trigger=None):
     '''
     M series DAQ cards do not have onboard timing engines for digital IO.
     Therefore, we have to create one (e.g., using a counter or by using the
@@ -592,8 +599,12 @@ def setup_hw_di(fs, lines, callback, callback_samples, clock=None):
                                       mx.DAQmx_Val_Low, 0, fs, 0.5)
         mx.DAQmxCfgImplicitTiming(clock_task, mx.DAQmx_Val_ContSamps, int(fs))
         clock += 'InternalOutput'
+        if trigger is not None:
+            mx.DAQmxCfgDigEdgeStartTrig(clock_task, trigger,
+                                        mx.DAQmx_Val_Rising)
     else:
         clock_task = None
+
 
     mx.DAQmxCfgSampClkTiming(task, clock, fs, mx.DAQmx_Val_Rising,
                              mx.DAQmx_Val_ContSamps, int(fs))
@@ -605,6 +616,14 @@ def setup_hw_di(fs, lines, callback, callback_samples, clock=None):
 
     task._cb_ptr = cb_ptr
     task._initial_state = initial_state
+
+    mx.DAQmxTaskControl(task, mx.DAQmx_Val_Task_Commit)
+    rate = ctypes.c_double()
+    mx.DAQmxGetSampClkRate(task, rate)
+    #print('DI rate', rate.value)
+    #mx.DAQmxGetSampClkTimebaseRate(task, rate)
+    #print('DI timebase', rate.value)
+
     return [task, clock_task]
 
 
@@ -719,9 +738,10 @@ class Engine(object):
         self.hw_ao_buffer_samples = self._uint32.value
         log.info('AO buffer size {} samples'.format(self.hw_ao_buffer_samples))
 
-    def configure_hw_ai(self, fs, lines, expected_range, names=None, sync_ao=True):
+    def configure_hw_ai(self, fs, lines, expected_range, names=None, trigger=None):
+        callback_samples = int(self.hw_ai_monitor_period*fs)
         task = setup_hw_ai(fs, lines, expected_range, self._hw_ai_callback,
-                           int(self.hw_ai_monitor_period*fs), sync_ao)
+                           callback_samples, trigger)
         task._fs = fs
         task._names = channel_names('ai', lines, names)
         self._tasks['hw_ai'] = task
@@ -735,11 +755,11 @@ class Engine(object):
         self._tasks['sw_ao'] = task
         self.write_sw_ao(initial_state)
 
-    def configure_hw_di(self, fs, lines, names=None, clock=None):
+    def configure_hw_di(self, fs, lines, names=None, clock=None, trigger=None):
         names = channel_names('digital', lines, names)
         callback_samples = int(self.hw_ai_monitor_period*fs)
         task, clock_task = setup_hw_di(fs, lines, self._hw_di_callback,
-                                       callback_samples, clock)
+                                       callback_samples, clock, trigger)
         task._names = names
         if clock_task is not None:
             self._tasks['hw_di_clock'] = clock_task
