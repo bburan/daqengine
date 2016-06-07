@@ -16,7 +16,7 @@ def main(device):
         engine.write_hw_ao(np.zeros(samples))
 
     def ai_callback(names, data):
-        print('{} samples acquired from {}'.format(data.shape, names))
+        print('{} samples acquired from {}'.format(data.shape[-1], names))
 
     def et_callback(change, line, event_time):
         print('{} edge on {} at {}'.format(change, line, event_time))
@@ -28,15 +28,20 @@ def main(device):
 
     queue = Queue.Queue()
     engine = Engine()
-    engine.configure_hw_ai(20e3, '/{}/ai0:4'.format(device), (-10, 10),
+
+    # Set the polling interval to a high value to minimize clutter on the scren.
+    engine.hw_ao_monitor_period = 5
+    engine.hw_ai_monitor_period = 5
+    engine.configure_hw_ai(1e3, '/{}/ai0:2'.format(device), (-10, 10),
                            sync_ao=False)
-    engine.configure_hw_ao(20e3, '/{}/ao0'.format(device), (-10, 10))
+    engine.configure_hw_ao(1e3, '/{}/ao0'.format(device), (-10, 10))
     engine.configure_et('/{}/port0/line0:7'.format(device), 'ao/SampleClock')
 
     engine.register_ao_callback(ao_callback)
     engine.register_ai_callback(ai_callback)
     engine.register_et_callback(et_callback)
     engine.register_ai_epoch_callback(ai_epoch_callback, queue)
+
     queue.put((0, 100))
     queue.put((15, 100))
     queue.put((55, 100))

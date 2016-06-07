@@ -43,10 +43,10 @@ def read_digital_lines(task, size=1):
     mx.DAQmxGetDINumLines(task, '', nlines)
     nsamp = ctypes.c_int32()
     nbytes = ctypes.c_int32()
-    data = np.empty(nlines.value*size, dtype=np.uint8)
+    data = np.empty((size, nlines.value), dtype=np.uint8)
     mx.DAQmxReadDigitalLines(task, size, 0, mx.DAQmx_Val_GroupByChannel, data,
-                             len(data), nsamp, nbytes, None)
-    return data
+                             data.size, nsamp, nbytes, None)
+    return data.T
 
 
 def constant_lookup(value):
@@ -176,6 +176,7 @@ class DigitalSamplesAcquiredCallbackHelper(object):
             self._callback(data)
             return 0
         except Exception as e:
+            raise
             log.exception(e)
             return -1
 
@@ -224,7 +225,19 @@ def coroutine(func):
 
 
 @coroutine
-def extract_edges(initial_state, min_samples, target):
+def extract_edges(names, initial_states, min_samples, target):
+    coroutines = []
+    for name, initial_state in zip(names, initial_states):
+        c = _extract_edges(name, initial_state, min_samples, target)
+        coroutines.append(c)
+    while True:
+        new_samples = (yield)
+        for cr, line_samples in zip(coroutines, new_samples):
+            cr.send(line_samples)
+
+
+@coroutine
+def _extract_edges(name, initial_state, min_samples, target):
     if min_samples < 1:
         raise ValueError('min_samples must be greater than 1')
     prior_samples = np.tile(initial_state, min_samples)
@@ -242,7 +255,7 @@ def extract_edges(initial_state, min_samples, target):
                     continue
                 edge = 'rising' if samples[tlb] == 1 else 'falling'
                 initial_state = samples[tlb]
-                target(edge, t_prior + tlb)
+                target(name, edge, t_prior + tlb)
 
         t_prior += new_samples.shape[-1]
         prior_samples = samples[..., -min_samples:]
@@ -276,8 +289,8 @@ def capture_epoch(names, start, duration, callback):
             # `accumulated_data`. We then update start to point to the last
             # acquired sample `i+d` and update duration to be the number of
             # samples we still need to capture.
-            i = current_start-tlb
-            d = min(remaining_duration, samples-i)
+            i = int(current_start-tlb)
+            d = int(min(remaining_duration, samples-i))
             accumulated_data.append(data[..., i:i+d])
             current_start += d
             remaining_duration -= d
@@ -554,11 +567,35 @@ def setup_hw_ai(fs, lines, expected_range, callback, callback_samples, sync_ao):
     return task
 
 
-def setup_hw_di(fs, lines, callback, callback_samples, sync_ao):
+def setup_hw_di(fs, lines, callback, callback_samples, clock=None):
+    '''
+    M series DAQ cards do not have onboard timing engines for digital IO.
+    Therefore, we have to create one (e.g., using a counter or by using the
+    analog input or output sample clock. 
+    '''
     task = create_task()
     mx.DAQmxCreateDIChan(task, lines, '', mx.DAQmx_Val_ChanForAllLines)
 
-    mx.DAQmxCfgSampClkTiming(task, 'ai/SampleClock', fs, mx.DAQmx_Val_Rising,
+    # Get the current state of the lines so that we know what happened during
+    # the first change detection event. Do this before configuring the timing
+    # of the lines (otherwise we have to start the master clock as well)!
+    mx.DAQmxStartTask(task)
+    initial_state = read_digital_lines(task, 1)
+    mx.DAQmxStopTask(task)
+
+    if clock is None:
+        clock = ''
+
+    if 'Ctr' in clock:
+        clock_task = create_task()
+        mx.DAQmxCreateCOPulseChanFreq(clock_task, clock, '', mx.DAQmx_Val_Hz,
+                                      mx.DAQmx_Val_Low, 0, fs, 0.5)
+        mx.DAQmxCfgImplicitTiming(clock_task, mx.DAQmx_Val_ContSamps, int(fs))
+        clock += 'InternalOutput'
+    else:
+        clock_task = None
+
+    mx.DAQmxCfgSampClkTiming(task, clock, fs, mx.DAQmx_Val_Rising,
                              mx.DAQmx_Val_ContSamps, int(fs))
 
     callback_helper = DigitalSamplesAcquiredCallbackHelper(callback)
@@ -567,7 +604,8 @@ def setup_hw_di(fs, lines, callback, callback_samples, sync_ao):
                                        int(callback_samples), 0, cb_ptr, None)
 
     task._cb_ptr = cb_ptr
-    return task
+    task._initial_state = initial_state
+    return [task, clock_task]
 
 
 def setup_sw_ao(lines, expected_range):
@@ -697,15 +735,18 @@ class Engine(object):
         self._tasks['sw_ao'] = task
         self.write_sw_ao(initial_state)
 
-    def configure_hw_di(self, fs, lines, names=None, sync_ao=True):
+    def configure_hw_di(self, fs, lines, names=None, clock=None):
         names = channel_names('digital', lines, names)
-        task = setup_hw_di(lines, self._hw_di_callback,
-                           int(self.hw_ai_monitor_period*fs), sync_ao=sync_ao)
+        callback_samples = int(self.hw_ai_monitor_period*fs)
+        task, clock_task = setup_hw_di(fs, lines, self._hw_di_callback,
+                                       callback_samples, clock)
         task._names = names
+        if clock_task is not None:
+            self._tasks['hw_di_clock'] = clock_task
         self._tasks['hw_di'] = task
 
-    def configure_hw_do(self, fs, lines):
-        pass
+    def configure_hw_do(self, fs, lines, names):
+        raise NotImplementedError
 
     def configure_sw_do(self, lines, names=None, initial_state=None):
         names = channel_names('digital', lines, names)
@@ -765,6 +806,9 @@ class Engine(object):
     def register_ai_callback(self, callback):
         self._callbacks.setdefault('ai', []).append(callback)
 
+    def register_di_callback(self, callback):
+        self._callbacks.setdefault('di', []).append(callback)
+
     def register_et_callback(self, callback):
         self._callbacks.setdefault('et', []).append(callback)
 
@@ -802,6 +846,25 @@ class Engine(object):
         generator = extract_epochs(task._names, queue, callback,
                                    buffer_samples)
         self._callbacks.setdefault('ai_epoch', []).append(generator)
+
+    def register_di_change_callback(self, callback, debounce=1):
+        '''
+        Configure change detection on hardware-timed digital inputs.
+
+        Parameters
+        ----------
+        callback : callable
+            Function to be called when a change event is detected on one of the
+            digital lines.
+        debounce : int
+            Number of samples to use for debouncing filter. The line must
+            maintain the new state for the specified number of samples before
+            the change is recorded. Set to 1 for no debouncing.
+        '''
+        task = self._tasks['hw_di']
+        generator = extract_edges(task._names, task._initial_state, debounce,
+                                  callback)
+        self._callbacks.setdefault('di_edges', []).append(generator)
 
     def write_hw_ao(self, data, offset=None):
         task = self._tasks['hw_ao']
@@ -873,8 +936,11 @@ class Engine(object):
             generator.send(samples)
 
     def _hw_di_callback(self, samples):
-        for cb in self._callbacks.get('hw_di', []):
+        task = self._tasks['hw_di']
+        for cb in self._callbacks.get('di', []):
             cb(task._names, samples)
+        for generator in self._callbacks.get('di_edges', []):
+            generator.send(samples)
 
     def _hw_ao_callback(self, offset, samples):
         names = self._tasks['hw_ao']._names
