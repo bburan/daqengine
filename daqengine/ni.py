@@ -64,6 +64,10 @@ def channel_info(channels, channel_type):
     elif channel_type == 'ao':
         mx.DAQmxCreateAOVoltageChan(task, channels, '', -10, 10,
                                     mx.DAQmx_Val_Volts, '')
+    elif channel_type == 'ai':
+        mx.DAQmxCreateAIVoltageChan(task, channels, '',
+                                    mx.DAQmx_Val_Cfg_Default, -10, 10,
+                                    mx.DAQmx_Val_Volts, '')
 
     channels = ctypes.create_string_buffer('', 4096)
     mx.DAQmxGetTaskChannels(task, channels, len(channels))
@@ -79,6 +83,16 @@ def channel_info(channels, channel_type):
 
 def channel_list(channels, channel_type):
     return channel_info(channels, channel_type)['channels']
+
+
+def channel_names(channel_type, lines, names):
+    lines = channel_list(lines, channel_type)
+    if names is not None:
+        if len(lines) != len(names):
+            raise ValueError('Number of names must match number of lines')
+    else:
+        names = lines
+    return names
 
 
 def device_list(channels, channel_type):
@@ -115,13 +129,16 @@ class SamplesGeneratedCallbackHelper(object):
             mx.DAQmxSetWriteRelativeTo(task, mx.DAQmx_Val_CurrWritePos)
             mx.DAQmxSetWriteOffset(task, 0)
             mx.DAQmxGetWriteCurrWritePos(task, self._uint64)
-            log.trace('Current write position %d', self._uint64.value)
+            offset = self._uint64.value
             mx.DAQmxGetWriteTotalSampPerChanGenerated(task, self._uint64)
-            log.trace('Total s/chan generated %d', self._uint64.value)
+            generated = self._uint64.value
             mx.DAQmxGetWriteSpaceAvail(task, self._uint32)
-            log.trace('Current write space available %d', self._uint32.value)
+            available = self._uint32.value
+            log.trace('Current write position %d', offset)
+            log.trace('Total s/chan generated %d', generated)
+            log.trace('Current write space available %d', available)
             if self._uint32.value != 0:
-                self._callback(self._uint32.value)
+                self._callback(offset, available)
             return 0
         except Exception as e:
             log.exception(e)
@@ -148,6 +165,21 @@ class SamplesAcquiredCallbackHelper(object):
             return -1
 
 
+class DigitalSamplesAcquiredCallbackHelper(object):
+
+    def __init__(self, callback):
+        self._callback = callback
+
+    def __call__(self, task, event_type, callback_samples, callback_data):
+        try:
+            data = read_digital_lines(task, callback_samples)
+            self._callback(data)
+            return 0
+        except Exception as e:
+            log.exception(e)
+            return -1
+
+
 class ChangeDetectionCallbackHelper(object):
 
     def __init__(self, lines, callback, initial_state, timer_task):
@@ -160,8 +192,8 @@ class ChangeDetectionCallbackHelper(object):
         # Read the value stored
         data = np.empty(100, dtype=np.double)
         result = ctypes.c_int32()
-        mx.DAQmxReadCounterF64(self._timer_task, -1, 0, data, len(data), result,
-                               None)
+        mx.DAQmxReadCounterF64(self._timer_task, -1, 0, data, len(data),
+                               result, None)
         data = data[:result.value]
         if len(data) != 1:
             raise SystemError('Too many event times acquired')
@@ -192,24 +224,51 @@ def coroutine(func):
 
 
 @coroutine
-def capture_epoch(start, duration, callback):
+def extract_edges(initial_state, min_samples, target):
+    if min_samples < 1:
+        raise ValueError('min_samples must be greater than 1')
+    prior_samples = np.tile(initial_state, min_samples)
+    t_prior = -min_samples
+    while True:
+        # Wait for new data to become available
+        new_samples = (yield)
+        samples = np.r_[prior_samples, new_samples]
+        ts_change = np.flatnonzero(np.diff(samples, axis=-1)) + 1
+        ts_change = np.r_[ts_change, samples.shape[-1]] 
+
+        for tlb, tub in zip(ts_change[:-1], ts_change[1:]):
+            if (tub-tlb) >= min_samples:
+                if initial_state == samples[tlb]:
+                    continue
+                edge = 'rising' if samples[tlb] == 1 else 'falling'
+                initial_state = samples[tlb]
+                target(edge, t_prior + tlb)
+
+        t_prior += new_samples.shape[-1]
+        prior_samples = samples[..., -min_samples:]
+
+
+@coroutine
+def capture_epoch(names, start, duration, callback):
     '''
     Coroutine to facilitate epoch acquisition
     '''
     # This coroutine will continue until it acquires all the samples it needs.
     # It then provides the samples to the callback function and exits the while
     # loop.
+    current_start = start
+    remaining_duration = duration
     accumulated_data = []
     while True:
         tlb, data = (yield)
         samples = data.shape[-1]
-        if start < tlb:
+        if current_start < tlb:
             # We have missed the start of the epoch. Notify the callback of this
             log.debug('Missed samples for epoch of %d samples starting at %d',
                       start, duration)
-            callback(start, duration, None)
+            callback(names, start, duration, None)
             break
-        elif start <= (tlb + samples):
+        elif current_start <= (tlb + samples):
             # The start of the epoch is somewhere inside `data`. Find the start
             # `i` and determine how many samples `d` to extract from `data`.
             # It's possible that data does not contain the entire epoch. In that
@@ -217,28 +276,28 @@ def capture_epoch(start, duration, callback):
             # `accumulated_data`. We then update start to point to the last
             # acquired sample `i+d` and update duration to be the number of
             # samples we still need to capture.
-            i = start-tlb
-            d = min(duration, samples-i)
+            i = current_start-tlb
+            d = min(remaining_duration, samples-i)
             accumulated_data.append(data[..., i:i+d])
-            start = start+d
-            duration -= d
+            current_start += d
+            remaining_duration -= d
 
             # Check to see if we've finished acquiring the entire epoch. If so,
             # send it to the callback. Also, do a sanity check on the parameters
             # (duration < 0 means that something happened and we can't recover.
-            if duration == 0:
+            if remaining_duration == 0:
                 accumulated_data = np.concatenate(accumulated_data, axis=-1)
-                callback(start, duration, accumulated_data)
+                callback(names, start, duration, accumulated_data)
                 break
-            elif duration < 0:
+            elif remaining_duration < 0:
                 log.debug('Acquired too many samples for epoch of %d samples '
                           'starting at %d', start, duration)
-                callback(start, duration, None)
+                callback(names, start, duration, None)
                 break
 
 
 @coroutine
-def extract_epochs(queue, callback, buffer_samples):
+def extract_epochs(names, queue, callback, buffer_samples):
     '''
     Parameters
     ----------
@@ -263,7 +322,7 @@ def extract_epochs(queue, callback, buffer_samples):
         # provided in seconds, but we need to convert this to number of samples.
         while not queue.empty():
             start, duration = queue.get()
-            epoch_coroutine = capture_epoch(start, duration, callback)
+            epoch_coroutine = capture_epoch(names, start, duration, callback)
             # Go through the data we've been caching to facilitate historical
             # acquisition of data.
             epoch_coroutines.append(epoch_coroutine)
@@ -385,8 +444,8 @@ def setup_event_timer(trigger, counter, clock, callback=None, edge='rising'):
 
 def setup_change_detect_callback(lines, callback, timer, names=None):
     # Since the user may have specified a range of lines (e.g.,
-    # 'Dev2/port0/line0:1') or listed each line individually (e.g.,
-    # 'Dev2/port0/line0, Dev2/port0/line1'), we need to extract the individual
+    # 'Dev1/port0/line0:1') or listed each line individually (e.g.,
+    # 'Dev1/port0/line0, Dev1/port0/line1'), we need to extract the individual
     # lines in the task. This allows the callback helper to report the name of
     # the line on which the event was detected.
     lines = channel_list(lines, 'digital')
@@ -463,7 +522,6 @@ def setup_hw_ai(fs, lines, expected_range, callback, callback_samples, sync_ao):
     lb, ub = expected_range
     mx.DAQmxCreateAIVoltageChan(task, lines, '', mx.DAQmx_Val_RSE, lb, ub,
                                 mx.DAQmx_Val_Volts, '')
-
     if sync_ao:
         mx.DAQmxCfgDigEdgeStartTrig(task, 'ao/StartTrigger',
                                     mx.DAQmx_Val_Rising)
@@ -488,6 +546,22 @@ def setup_hw_ai(fs, lines, expected_range, callback, callback_samples, sync_ao):
     mx.DAQmxSetBufInputBufSize(task, int(new_buffer_size))
 
     callback_helper = SamplesAcquiredCallbackHelper(callback, n_channels)
+    cb_ptr = mx.DAQmxEveryNSamplesEventCallbackPtr(callback_helper)
+    mx.DAQmxRegisterEveryNSamplesEvent(task, mx.DAQmx_Val_Acquired_Into_Buffer,
+                                       int(callback_samples), 0, cb_ptr, None)
+
+    task._cb_ptr = cb_ptr
+    return task
+
+
+def setup_hw_di(fs, lines, callback, callback_samples, sync_ao):
+    task = create_task()
+    mx.DAQmxCreateDIChan(task, lines, '', mx.DAQmx_Val_ChanForAllLines)
+
+    mx.DAQmxCfgSampClkTiming(task, 'ai/SampleClock', fs, mx.DAQmx_Val_Rising,
+                             mx.DAQmx_Val_ContSamps, int(fs))
+
+    callback_helper = DigitalSamplesAcquiredCallbackHelper(callback)
     cb_ptr = mx.DAQmxEveryNSamplesEventCallbackPtr(callback_helper)
     mx.DAQmxRegisterEveryNSamplesEvent(task, mx.DAQmx_Val_Acquired_Into_Buffer,
                                        int(callback_samples), 0, cb_ptr, None)
@@ -533,7 +607,7 @@ class Engine(object):
     # you want to see data as soon as possible, set the poll period to a small
     # value. If your application is stalling or freezing, set this to a larger
     # value.
-    hw_ai_monitor_period = 0.25
+    hw_ai_monitor_period = 0.1
 
     # Even though data is written to the analog outputs, it is buffered in
     # computer memory until it's time to be transferred to the onboard buffer of
@@ -581,7 +655,7 @@ class Engine(object):
         self._uint64 = ctypes.c_uint64()
         self._int32 = ctypes.c_int32()
 
-    def configure_hw_ao(self, fs, lines, expected_range):
+    def configure_hw_ao(self, fs, lines, expected_range, names=None):
         '''
         Initialize hardware-timed analog output
 
@@ -590,58 +664,54 @@ class Engine(object):
         fs : float
             Sampling frequency of output (e.g., 100e3).
         lines : str
-            Analog output lines to use (e.g., 'Dev2/ao0:4' to specify a range of
-            lines or 'Dev2/ao0,Dev2/ao4' to specify specific lines).
+            Analog output lines to use (e.gk., 'Dev1/ao0:4' to specify a range of
+            lines or 'Dev1/ao0,Dev1/ao4' to specify specific lines).
         expected_range : (float, float)
             Tuple of upper/lower end of expected range. The maximum range
             allowed by most NI devices is (-10, 10). Some devices (especially
             newer ones) will optimize the output resolution based on the
             expected range of the signal.
         '''
-        task = setup_hw_ao(fs, lines, expected_range, self._samples_needed,
+        task = setup_hw_ao(fs, lines, expected_range, self._hw_ao_callback,
                            int(self.hw_ao_monitor_period*fs))
+        task._names = channel_names('ao', lines, names)
         self._tasks['hw_ao'] = task
 
-    def configure_hw_ai(self, fs, lines, expected_range, sync_ao=True):
-        task = setup_hw_ai(fs, lines, expected_range, self._samples_acquired,
+        mx.DAQmxGetBufOutputBufSize(self._tasks['hw_ao'], self._uint32)
+        self.hw_ao_buffer_samples = self._uint32.value
+        log.info('AO buffer size {} samples'.format(self.hw_ao_buffer_samples))
+
+    def configure_hw_ai(self, fs, lines, expected_range, names=None, sync_ao=True):
+        task = setup_hw_ai(fs, lines, expected_range, self._hw_ai_callback,
                            int(self.hw_ai_monitor_period*fs), sync_ao)
         task._fs = fs
+        task._names = channel_names('ai', lines, names)
         self._tasks['hw_ai'] = task
 
     def configure_sw_ao(self, lines, expected_range, names=None,
                         initial_state=None):
-        lines = channel_list(lines, 'ao')
-        if names is not None:
-            if len(lines) != len(names):
-                raise ValueError('Number of names must match number of lines')
-        else:
-            names = lines
         if initial_state is None:
             initial_state = np.zeros(len(names), dtype=np.double)
-
-        task = setup_sw_ao(','.join(lines), expected_range)
-        task._names = names
+        task = setup_sw_ao(lines, expected_range)
+        task._names = channel_names('ao', lines, names)
         self._tasks['sw_ao'] = task
         self.write_sw_ao(initial_state)
 
-    def configure_hw_di(self, fs, lines):
-        pass
+    def configure_hw_di(self, fs, lines, names=None, sync_ao=True):
+        names = channel_names('digital', lines, names)
+        task = setup_hw_di(lines, self._hw_di_callback,
+                           int(self.hw_ai_monitor_period*fs), sync_ao=sync_ao)
+        task._names = names
+        self._tasks['hw_di'] = task
 
     def configure_hw_do(self, fs, lines):
         pass
 
     def configure_sw_do(self, lines, names=None, initial_state=None):
-        lines = channel_list(lines, 'digital')
-        if names is not None:
-            if len(lines) != len(names):
-                raise ValueError('Number of names must match number of lines')
-        else:
-            names = lines
-
+        names = channel_names('digital', lines, names)
         if initial_state is None:
             initial_state = np.zeros(len(names), dtype=np.uint8)
-
-        task = setup_sw_do(','.join(lines))
+        task = setup_sw_do(lines)
         task._names = names
         self._tasks['sw_do'] = task
         self.write_sw_do(initial_state)
@@ -658,7 +728,7 @@ class Engine(object):
         Parameters
         ----------
         lines : string
-            Digital lines (in NI-DAQmx syntax, e.g., 'Dev2/port0/line0:4') to
+            Digital lines (in NI-DAQmx syntax, e.g., 'Dev1/port0/line0:4') to
             monitor.
         clock : string
             Reference clock from which timestamps will be drawn.
@@ -729,7 +799,8 @@ class Engine(object):
         '''
         task = self._tasks['hw_ai']
         buffer_samples = int(buffer_size*task._fs)
-        generator = extract_epochs(queue, callback, buffer_samples)
+        generator = extract_epochs(task._names, queue, callback,
+                                   buffer_samples)
         self._callbacks.setdefault('ai_epoch', []).append(generator)
 
     def write_hw_ao(self, data, offset=None):
@@ -746,8 +817,8 @@ class Engine(object):
             mx.DAQmxSetWriteOffset(task, 0)
             log.trace('Writing %d samples to end of buffer', data.size)
         mx.DAQmxWriteAnalogF64(task, data.shape[-1], False, 0,
-                               mx.DAQmx_Val_GroupByChannel, data, self._int32,
-                               None)
+                               mx.DAQmx_Val_GroupByChannel,
+                               data.astype(np.float64), self._int32, None)
         if self._int32.value != data.shape[-1]:
             raise ValueError('Unable to write all samples to channel')
 
@@ -794,20 +865,25 @@ class Engine(object):
         for cb in self._callbacks.get('et', []):
             cb(change, line, event_time)
 
-    def _samples_acquired(self, samples):
+    def _hw_ai_callback(self, samples):
+        task = self._tasks['hw_ai']
         for cb in self._callbacks.get('ai', []):
-            cb(samples)
+            cb(task._names, samples)
         for generator in self._callbacks.get('ai_epoch', []):
             generator.send(samples)
 
-    def _samples_needed(self, samples):
+    def _hw_di_callback(self, samples):
+        for cb in self._callbacks.get('hw_di', []):
+            cb(task._names, samples)
+
+    def _hw_ao_callback(self, offset, samples):
+        names = self._tasks['hw_ao']._names
         for cb in self._callbacks.get('ao', []):
-            cb(samples)
+            cb(names, offset, samples)
 
     def start(self):
         if 'hw_ao' in self._tasks:
-            mx.DAQmxGetBufOutputBufSize(self._tasks['hw_ao'], self._uint32)
-            log.info('AO buffer size {} samples'.format(self._uint32.value))
+            self._hw_ao_callback(0, self.hw_ao_buffer_samples)
         for task in self._tasks.values():
             mx.DAQmxStartTask(task)
 
@@ -836,399 +912,3 @@ class Engine(object):
         task = self._tasks['hw_ao']
         mx.DAQmxGetWriteTotalSampPerChanGenerated(task, self._uint64)
         return self._uint64.value
-
-
-################################################################################
-# demo
-################################################################################
-def demo_timer(device='Dev2'):
-    '''
-    Demonstrates accurate timestamp detection of rising and falling edges on
-    PFI1 and PFI2.  To test this, use the Dev2 Test Panels (via the Measurement
-    & Automation Explorer) to toggle the state of the digital lines on port 1
-    between high and low.  Whenever a line is toggled to high, this will trigger
-    an event.
-    '''
-    def event_timer_callback(task):
-        src = ctypes.create_string_buffer('', size=512)
-        mx.DAQmxGetSampClkSrc(task, src, 512)
-        edge = ctypes.c_int32()
-        mx.DAQmxGetSampClkActiveEdge(task, edge)
-        data = np.empty(100, dtype=np.double)
-        result = ctypes.c_int32()
-        mx.DAQmxReadCounterF64(task, -1, 0, data, len(data), result, None)
-        m = 'An {} event on {} was detected at time {}' \
-            .format(constant_lookup(edge.value), src.value, data[:result.value])
-        print(m)
-
-    timebase = '/Dev2/10MHzRefClock'
-    t1 = setup_event_timer('/Dev2/PFI1', '/Dev2/Ctr0', timebase,
-                           callback=event_timer_callback)
-    t2 = setup_event_timer('/Dev2/PFI1', '/Dev2/Ctr1', timebase,
-                           callback=event_timer_callback, edge='falling')
-    t3 = setup_event_timer('/Dev2/PFI2', '/Dev2/Ctr2', timebase,
-                           callback=event_timer_callback)
-    mx.DAQmxStartTask(t1)
-    mx.DAQmxStartTask(t2)
-    mx.DAQmxStartTask(t3)
-    raw_input('Demo running. Hit enter to exit.\n')
-
-
-def demo_change_detect():
-    '''
-    Demonstrates detection of changes digital state of lines, including an
-    accurate event timer using the 10MHz timebase.  To convert the timestamp to
-    seconds, divide by 10 MHz.
-    '''
-    def callback(edge, line, event_time):
-        print('{} edge on {} at {}'.format(edge, line, event_time/10e6))
-
-    timer_task = setup_event_timer('/Dev2/ChangeDetectionEvent', '/Dev2/Ctr0',
-                                   '/Dev2/10MhzRefClock')
-    cd_task = setup_change_detect_callback('/Dev2/port0/line0:2', callback,
-                                           timer=timer_task,
-                                           names=['spout', 'lick', 'poke'])
-    mx.DAQmxStartTask(timer_task)
-    mx.DAQmxStartTask(cd_task)
-    raw_input('Demo running. Hit enter to exit.\n')
-
-
-def simple_engine_demo():
-    '''
-    This demonstrates the basic Engine interface that we will be using to
-    communicate with the DAQ hardware. A subclass of the Engine will implement
-    NI hardware-specific logic.  Another subclass will implement MCC
-    (TBSI)-specific logic. This enables us to write code that does not care
-    whether it's communicating with a NI or MCC device.
-    '''
-    def ao_callback(samples):
-        print('{} samples generated'.format(samples))
-
-    def ai_callback(samples):
-        print('{} samples acquired'.format(samples.shape))
-
-    def et_callback(change, line, event_time):
-        print('{} edge on {} at {}'.format(change, line, event_time))
-        queue.put((event_time-100, 100))
-
-    def ai_epoch_callback(start, duration, samples):
-        print('Epoch {} acquired with {} samples'.format(start, samples.shape))
-
-    import Queue
-    queue = Queue.Queue()
-
-    initial_data = np.zeros(1000e3, dtype=np.double)
-    engine = Engine()
-    engine.configure_hw_ai(20e3, '/Dev2/ai0:4', (-10, 10), sync_ao=False)
-    engine.configure_hw_ao(20e3, '/Dev2/ao0', (-10, 10))
-    engine.configure_et('/Dev2/port0/line0:7', 'ao/SampleClock')
-
-    engine.register_ao_callback(ao_callback)
-    engine.register_ai_callback(ai_callback)
-    engine.register_et_callback(et_callback)
-    engine.register_ai_epoch_callback(ai_epoch_callback, queue)
-    queue.put((0, 100))
-    queue.put((15, 100))
-    queue.put((55, 100))
-
-    engine.write_hw_ao(initial_data)
-    engine.start()
-    raw_input('Demo running. Hit enter to exit.\n')
-    return engine
-
-
-class EngineDemo(object):
-    '''
-    Supporting class for the masker_engine_demo
-    '''
-
-    def __init__(self):
-        from scipy.io import wavfile
-
-        # Read in the stimulus files and convert them to a floating-point value
-        # between 0 and 1 by dividing against the maximum possible value
-        # specified by the dtype (e.g., 16 bit signed has a maximum value of
-        # 32767).
-        fs_masker, masker = wavfile.read('stimuli/supermasker1_1k.wav')
-        fs_T00, T00 = wavfile.read('stimuli/T00.wav')
-        fs_T01, T01 = wavfile.read('stimuli/T01.wav')
-        self.masker = masker.astype(np.double)/np.iinfo(masker.dtype).max
-        self.T00 = T00.astype(np.double)/np.iinfo(T00.dtype).max
-        self.T01 = T01.astype(np.double)/np.iinfo(T01.dtype).max
-
-        # Ensure sampling rate is identical among all three files otherwise this
-        # won't work.
-        if (fs_masker != fs_T00) or (fs_masker != fs_T01):
-            raise ValueError('Cannot reconcile sampling rate difference')
-        self.fs = fs_masker
-
-        # TEMPORARY - use a sine wave as the masker. Discontinuities are more
-        # obvious when using this.
-        t = np.arange(int(self.fs*5), dtype=np.double)/self.fs
-        self.masker = np.sin(2*np.pi*5*t)
-
-        # How soon after the "trigger" (i.e., the decision to start a trial)
-        # should the target be inserted? This needs to give Neurobehavior
-        # sufficient time to generate the waveform and overwrite the buffer.
-        self.update_delay = int(self.fs*0.25)
-
-        # How often should we add new masker data to the buffer?
-        self.update_interval = int(self.fs*1)
-
-        # Place to save acquired data
-        self._acquired = []
-        self._event_times = []
-        self._masker_offset = 0
-
-        self.engine = Engine()
-        self.engine.configure_hw_ai(self.fs, 'Dev2/ai0', (-10, 10))
-        self.engine.configure_hw_ao(self.fs, 'Dev2/ao0', (-10, 10))
-        self.engine.configure_et('/Dev2/port0/line0', 'ao/SampleClock',
-                                 names=['trigger'])
-        self.engine.write_hw_ao(self.masker)
-
-        self.engine.register_ao_callback(self.samples_needed)
-        self.engine.register_ai_callback(self.samples_acquired)
-        self.engine.register_et_callback(self.et_fired)
-
-        self.engine.start()
-
-    def et_fired(self, edge, line, timestamp):
-        if edge == 'rising' and line == 'trigger':
-            log.debug('Detected trigger at %d', timestamp)
-            self._event_times.append(timestamp)
-            offset = int(timestamp) + self.update_delay
-            log.debug('Inserting target at %d', offset)
-            duration = self.engine.ao_write_space_available(offset)/2
-            log.debug('Overwriting %d samples in buffer', duration)
-            result = self._get_masker(offset, duration)
-            result[:self.T01.shape[-1]] += self.T01*0.1
-            self.engine.write_hw_ao(result, offset)
-            self.engine.write_hw_ao(result)
-            self._masker_offset = offset + result.shape[-1]
-
-    def samples_acquired(self, samples):
-        self._acquired.append(samples)
-
-    def samples_needed(self, samples):
-        result = self._get_masker(self._masker_offset, samples)
-        self.engine.write_hw_ao(result)
-        self._masker_offset += samples
-
-    def _get_masker(self, masker_offset, masker_duration):
-        '''
-        Get the next `duration` samples of the masker starting at `offset`. If
-        reading past the end of the array, loop around to the beginning.
-        '''
-        masker_size = self.masker.shape[-1]
-        offset = masker_offset % masker_size
-        duration = masker_duration
-        result = []
-        while True:
-            if (offset+duration) < masker_size:
-                subset = self.masker[offset:offset+duration]
-                duration = 0
-            else:
-                subset = self.masker[offset:]
-                offset = 0
-                duration = duration-subset.shape[-1]
-            result.append(subset)
-            if duration == 0:
-                break
-        return np.concatenate(result, axis=-1)
-
-
-def masker_engine_demo():
-    '''
-    Similar to the original demo code. Demonstrates how one might quickly
-    overwrite samples in the analog output buffer in response to an event.
-    '''
-    import pylab as pl
-    import time
-    engine_demo = EngineDemo()
-    raw_input('Demo running. Hit enter to exit.\n')
-    engine_demo.engine.stop()
-    acquired = np.concatenate(engine_demo._acquired, axis=-1)
-    event_times = np.array(engine_demo._event_times)/engine_demo.fs
-    t = np.arange(acquired.shape[-1], dtype=np.double)/engine_demo.fs
-    pl.plot(t, acquired.T, 'k-')
-    pl.plot(event_times, np.zeros_like(event_times), 'ro')
-    pl.show()
-
-
-def demo_sw():
-    '''
-    Demonstrates the use of software-timed analog outputs and digital outputs.
-    Software-timed outputs change the state (or value) of an output to the new
-    level as soon as requested by the program.
-
-    A common use-case for software-timed digital outputs is to generate a TTL
-    (i.e., a square pulse) to trigger something (e.g., a water pump). I have
-    included convenience functions (`fire_sw_do`) to facilitate this.
-
-    I also have included name aliases. NI-DAQmx refers to the lines using the
-    arcane syntax (e.g., 'Dev2/ao0' or 'Dev2/port0/line0'). However, it is
-    probably easier (and generates more readable programs), if we can assign
-    aliases to these lines. For example, if 'Dev2/ao0' is connected to a
-    Coulbourn shock controller which uses the analog signal to control the
-    intensity of the shock, we may want to call that output 'shock_level'.
-    Likewise, if 'Dev2/port0/line1' is connected to the trigger port of a pellet
-    dispenser, we probably want to call that line 'food_dispense'.
-    '''
-    import time
-    engine = Engine()
-    # Configure four digital outputs and give them the aliases 'a', 'b', 'c',
-    # and 'd'.
-    engine.configure_sw_do('Dev2/port0/line0:3', ['a', 'b', 'c', 'd'],
-                           initial_state=[1, 0, 1, 1])
-    # Configure two analog otuputs and give them aliases (i.e., assume ao0
-    # controls shock level and ao1 controls pump rate).
-    engine.configure_sw_ao('Dev2/ao0:1', (-10, 10),
-                           ['shock_level', 'pump_rate'])
-    time.sleep(1)
-
-    # You can connect ao0 to ai0 and use the analog input panel on the MAX test
-    # panels to observe the changes to the analog output.
-    engine.set_sw_ao('shock_level', 5)
-    engine.set_sw_ao('pump_rate', 4)
-
-     # You can connect the digital lines for port0 to port1 and then monitor the
-     # changes on port1 using the digital panel on the MAX test panels.
-    time.sleep(1)
-    engine.write_sw_do([0, 0, 0, 0])
-    engine.start()
-    engine.set_sw_do('a', 1)
-    time.sleep(0.25)
-    engine.set_sw_do('b', 1)
-    time.sleep(0.25)
-    engine.set_sw_do('c', 1)
-    time.sleep(0.25)
-    engine.set_sw_do('a', 0)
-    time.sleep(0.25)
-    engine.set_sw_do('b', 0)
-    time.sleep(0.25)
-    engine.set_sw_do('c', 0)
-    time.sleep(0.25)
-
-    # Generate a TTL pulse of varying duration (in sec).
-    engine.fire_sw_do('a', 0.25)
-    engine.fire_sw_do('b', 0.5)
-    engine.fire_sw_do('c', 1)
-    time.sleep(1)
-
-
-class AccumulatorDemo(object):
-    # TODO - make this a unittest
-
-    def __init__(self):
-        from Queue import Queue
-        from uuid import uuid4
-        queue = Queue()
-        self._accumulated = []
-        extractor = extract_epochs(queue, self.epoch_acquired_cb, 100)
-        queue.put((10, 10))
-        queue.put((5, 15))
-        queue.put((300, 25))
-        extractor.send(np.arange(100))
-        queue.put((50, 25))
-        queue.put((150, 13))
-        extractor.send(np.arange(100, 200))
-        extractor.send(np.arange(200, 400))
-        queue.put((0, 100))       # will be lost
-        queue.put((300, 25))      # will be drawn from buffer
-        queue.put((350, 100))     # will be drawn from buffer plus
-                                             #  next acquisition
-        queue.put((350, 125))     # will be drawn from buffer plus
-                                             #  next two acquisitions
-        queue.put((350, 150))     # will be drawn from buffer plus
-                                             #  next three acquisitions
-        extractor.send(np.arange(400, 450))
-        extractor.send(np.arange(450, 475))
-        extractor.send(np.arange(475, 500))
-        raw_input('Demo running. Press enter to exit.')
-
-    def epoch_acquired_cb(self, start, duration, data):
-        if data is None:
-            print('epoch {} was lost'.format(start))
-        else:
-            print('epoch {} acquired with shape {}'.format(start, data.shape))
-            print(data)
-
-
-def test_write():
-    import pylab as pl
-
-    class WriteTest(object):
-
-        def __init__(self):
-            self.ai_task = setup_hw_ai(25e3, '/Dev2/ai0', (-10, 10),
-                                       self.ai_callback, 2500, sync_ao=True)
-            self.ao_task = setup_hw_ao(25e3, '/Dev2/ao0', (-10, 10),
-                                       self.ao_callback, 10000)
-            self.acquired = []
-            self.ao_callback(10000, 1)
-            mx.DAQmxStartTask(self.ai_task)
-            mx.DAQmxStartTask(self.ao_task)
-            result = ctypes.c_int32()
-            self.ao_callback(2500, 0.5)
-
-            mx.DAQmxSetWriteRelativeTo(self.ao_task, mx.DAQmx_Val_FirstSample)
-            mx.DAQmxSetWriteOffset(self.ao_task, 10000+2500-1250)
-            self.ao_callback(2500, 0)
-
-            result = ctypes.c_uint64()
-            mx.DAQmxGetWriteCurrWritePos(self.ao_task, result)
-            written = result.value
-
-            result = ctypes.c_uint64()
-            mx.DAQmxGetWriteTotalSampPerChanGenerated(self.ao_task, result)
-            generated = result.value
-
-            print('Current generate position', result.value)
-            print('Current write position', written)
-
-            mx.DAQmxSetWriteRelativeTo(self.ao_task, mx.DAQmx_Val_FirstSample)
-            #mx.DAQmxSetWriteOffset(self.ao_task, written-5000)
-            mx.DAQmxSetWriteOffset(self.ao_task, generated+8300)
-            self.ao_callback(2500, -1)
-
-        def ao_callback(self, samples, sf=2):
-            try:
-                result = ctypes.c_uint64()
-                mx.DAQmxGetWriteCurrWritePos(self.ao_task, result)
-                print('Current write position', result.value)
-                mx.DAQmxGetWriteSpaceAvail(self.ao_task, result)
-                print('Current write space available', result.value)
-            except:
-                pass
-
-            result = ctypes.c_int32()
-            data = np.ones(samples)*sf
-            mx.DAQmxWriteAnalogF64(self.ao_task, data.shape[-1], False, 0,
-                                   mx.DAQmx_Val_GroupByChannel, data, result,
-                                   None)
-
-        def ai_callback(self, samples):
-            self.acquired.append(samples)
-
-    test = WriteTest()
-    raw_input('ready')
-    mx.DAQmxStopTask(test.ao_task)
-    acquired = np.concatenate(test.acquired, axis=-1)
-    pl.plot(acquired.T)
-    pl.show()
-
-
-################################################################################
-# Test cases
-################################################################################
-
-if __name__ == '__main__':
-    logging.basicConfig(level='TRACE')
-    demo_timer()
-    #demo_change_detect()
-    #demo_sw()
-    #simple_engine_demo()
-    #masker_engine_demo()
-    #AccumulatorDemo()
-    #test_write()
