@@ -247,7 +247,7 @@ def _extract_edges(name, initial_state, min_samples, target):
         new_samples = (yield)
         samples = np.r_[prior_samples, new_samples]
         ts_change = np.flatnonzero(np.diff(samples, axis=-1)) + 1
-        ts_change = np.r_[ts_change, samples.shape[-1]] 
+        ts_change = np.r_[ts_change, samples.shape[-1]]
 
         for tlb, tub in zip(ts_change[:-1], ts_change[1:]):
             if (tub-tlb) >= min_samples:
@@ -532,6 +532,42 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples,
     return task
 
 
+def setup_timing(task, fs, samples=np.inf, start_trigger=None):
+    '''
+    Configures timing for task
+
+    Parameters
+    ----------
+    task : niDAQmx task handle
+        Task to configure timing for
+    fs : string or float
+        If string, must be the name of a sample clock (e.g. ao/SampleClock) that
+        the acquistion will be tied to. If float, the internal sample clock for
+        that task will be used and the sample rate will be set to fs.
+    samples :  float
+        If infinite, the task will be set to continuous acquistion. If finite,
+        the task will be set to acquire the specified number of samples.
+    start_trigger : string
+        Name of digtial line to start acquisition on. Can be set to any PFI line
+        or to one of the analog sources (e.g., ao/StartTrigger or
+        ai/StartTrigger).
+    '''
+    if start_trigger is not None:
+        mx.DAQmxCfgDigEdgeStartTrig(task, trigger, mx.DAQmx_Val_Rising)
+    if isinstance(fs, basestring):
+        sample_clock = fs
+        fs = 200e3
+    else:
+        sample_clock = ''
+    if samples is np.inf:
+        sample_mode = mx.DAQmx_Val_ContSamps
+        samples = int(fs)
+    else:
+        sample_mode = mx.DAQmx_Val_FiniteSamps
+    mx.DAQmxCfgSampClkTiming(task, sample_clock, fs, mx.DAQmx_Val_Rising,
+                             sample_mode, samples)
+
+
 def setup_hw_ai(fs, lines, expected_range, callback, callback_samples,
                 trigger=None):
     # Record AI filter delay
@@ -539,11 +575,7 @@ def setup_hw_ai(fs, lines, expected_range, callback, callback_samples,
     lb, ub = expected_range
     mx.DAQmxCreateAIVoltageChan(task, lines, '', mx.DAQmx_Val_RSE, lb, ub,
                                 mx.DAQmx_Val_Volts, '')
-    if trigger is not None:
-        mx.DAQmxCfgDigEdgeStartTrig(task, trigger, mx.DAQmx_Val_Rising)
-
-    mx.DAQmxCfgSampClkTiming(task, '', fs, mx.DAQmx_Val_Rising,
-                             mx.DAQmx_Val_ContSamps, int(fs))
+    setup_timing(task, fs, np.inf, start_trigger)
 
     result = ctypes.c_uint32()
     mx.DAQmxGetBufInputBufSize(task, result)
@@ -573,12 +605,12 @@ def setup_hw_ai(fs, lines, expected_range, callback, callback_samples,
     return task
 
 
-def setup_hw_di(fs, lines, callback, callback_samples, clock=None,
-                trigger=None):
+def setup_hw_di(fs, lines, callback, callback_samples, trigger=None,
+                clock=None):
     '''
     M series DAQ cards do not have onboard timing engines for digital IO.
     Therefore, we have to create one (e.g., using a counter or by using the
-    analog input or output sample clock. 
+    analog input or output sample clock.
     '''
     task = create_task()
     mx.DAQmxCreateDIChan(task, lines, '', mx.DAQmx_Val_ChanForAllLines)
@@ -590,10 +622,9 @@ def setup_hw_di(fs, lines, callback, callback_samples, clock=None,
     initial_state = read_digital_lines(task, 1)
     mx.DAQmxStopTask(task)
 
-    if clock is None:
-        clock = ''
-
-    if 'Ctr' in clock:
+    # M-series acquisition boards don't have a dedicated engine for digital
+    # acquisition. Use a clock to configure the acquisition.
+    if clock is not None:
         clock_task = create_task()
         mx.DAQmxCreateCOPulseChanFreq(clock_task, clock, '', mx.DAQmx_Val_Hz,
                                       mx.DAQmx_Val_Low, 0, fs, 0.5)
@@ -602,12 +633,9 @@ def setup_hw_di(fs, lines, callback, callback_samples, clock=None,
         if trigger is not None:
             mx.DAQmxCfgDigEdgeStartTrig(clock_task, trigger,
                                         mx.DAQmx_Val_Rising)
+        setup_timing(task, clock, np.inf, None)
     else:
-        clock_task = None
-
-
-    mx.DAQmxCfgSampClkTiming(task, clock, fs, mx.DAQmx_Val_Rising,
-                             mx.DAQmx_Val_ContSamps, int(fs))
+        setup_timing(task, fs, np.inf, start_trigger)
 
     callback_helper = DigitalSamplesAcquiredCallbackHelper(callback)
     cb_ptr = mx.DAQmxEveryNSamplesEventCallbackPtr(callback_helper)
@@ -620,10 +648,6 @@ def setup_hw_di(fs, lines, callback, callback_samples, clock=None,
     mx.DAQmxTaskControl(task, mx.DAQmx_Val_Task_Commit)
     rate = ctypes.c_double()
     mx.DAQmxGetSampClkRate(task, rate)
-    #print('DI rate', rate.value)
-    #mx.DAQmxGetSampClkTimebaseRate(task, rate)
-    #print('DI timebase', rate.value)
-
     return [task, clock_task]
 
 
@@ -738,7 +762,8 @@ class Engine(object):
         self.hw_ao_buffer_samples = self._uint32.value
         log.info('AO buffer size {} samples'.format(self.hw_ao_buffer_samples))
 
-    def configure_hw_ai(self, fs, lines, expected_range, names=None, trigger=None):
+    def configure_hw_ai(self, fs, lines, expected_range, names=None,
+                        trigger=None):
         callback_samples = int(self.hw_ai_monitor_period*fs)
         task = setup_hw_ai(fs, lines, expected_range, self._hw_ai_callback,
                            callback_samples, trigger)
@@ -755,11 +780,11 @@ class Engine(object):
         self._tasks['sw_ao'] = task
         self.write_sw_ao(initial_state)
 
-    def configure_hw_di(self, fs, lines, names=None, clock=None, trigger=None):
+    def configure_hw_di(self, fs, lines, names=None, trigger=None, clock=None):
         names = channel_names('digital', lines, names)
         callback_samples = int(self.hw_ai_monitor_period*fs)
         task, clock_task = setup_hw_di(fs, lines, self._hw_di_callback,
-                                       callback_samples, clock, trigger)
+                                       callback_samples, trigger, clock)
         task._names = names
         if clock_task is not None:
             self._tasks['hw_di_clock'] = clock_task
