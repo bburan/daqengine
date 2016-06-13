@@ -225,6 +225,14 @@ def coroutine(func):
 
 
 @coroutine
+def analog_threshold(names, threshold, debounce, target):
+    coroutine = extract_edges(names, [0]*len(names), debounce, target)
+    while True:
+        samples = (yield)
+        coroutine.send(samples >= threshold)
+
+
+@coroutine
 def extract_edges(names, initial_states, min_samples, target):
     coroutines = []
     for name, initial_state in zip(names, initial_states):
@@ -891,6 +899,14 @@ class Engine(object):
                                    buffer_samples)
         self._callbacks.setdefault('ai_epoch', []).append(generator)
 
+    def register_ai_threshold_callback(self, callback, threshold, debounce=1):
+        '''
+        Configure threshold detection on hardware-timed analog inputs.
+        '''
+        names = self._tasks['hw_ai']._names
+        coroutine = analog_threshold(names, threshold, debounce, callback)
+        self._callbacks.setdefault('ai_threshold', []).append(coroutine)
+
     def register_di_change_callback(self, callback, debounce=1):
         '''
         Configure change detection on hardware-timed digital inputs.
@@ -977,6 +993,8 @@ class Engine(object):
         for cb in self._callbacks.get('ai', []):
             cb(task._names, samples)
         for generator in self._callbacks.get('ai_epoch', []):
+            generator.send(samples)
+        for generator in self._callbacks.get('ai_threshold', []):
             generator.send(samples)
 
     def _hw_di_callback(self, samples):
