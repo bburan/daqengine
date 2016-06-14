@@ -19,7 +19,7 @@ def main(device):
                                            names=['spout', 'lick', 'poke'])
     mx.DAQmxStartTask(timer_task)
     mx.DAQmxStartTask(cd_task)
-    raw_input('Connect port1/line0:2 to port0/line0:2. \n'
+    raw_input('Connect some lines from port1 to port0/line0:2. \n'
               'Toggle state of port 1 lines using MAX. \n'
               'Hit enter to exit.\n')
 

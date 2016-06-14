@@ -27,6 +27,7 @@ from __future__ import print_function
 from collections import OrderedDict
 import ctypes
 from threading import Timer
+import types
 
 import numpy as np
 import PyDAQmx as mx
@@ -183,10 +184,9 @@ class DigitalSamplesAcquiredCallbackHelper(object):
 
 class ChangeDetectionCallbackHelper(object):
 
-    def __init__(self, lines, callback, initial_state, timer_task):
+    def __init__(self, callback, initial_state, timer_task):
         self._callback = callback
         self._prev_state = initial_state
-        self._lines = lines
         self._timer_task = timer_task
 
     def _get_event_time(self):
@@ -202,13 +202,18 @@ class ChangeDetectionCallbackHelper(object):
 
     def __call__(self, task, *args):
         try:
-            current_state = read_digital_lines(task)
+            current_state = read_digital_lines(task).ravel()
             et = self._get_event_time()
-            for (l, p, c) in zip(self._lines, self._prev_state, current_state):
-                if p != c:
-                    edge = 'rising' if p == 0 else 'falling'
-                    self._callback(edge, l, et)
-            self._prev_state = current_state
+            print(self._prev_state, current_state)
+            try:
+                for (i, (p, c)) in enumerate(zip(self._prev_state, current_state)):
+                    if p != c:
+                        edge = 'rising' if p == 0 else 'falling'
+                        self._callback(i, edge, et)
+            except Exception as e:
+                print(e)
+            finally:
+                self._prev_state = current_state
             return 0
         except Exception as e:
             log.exception(e)
@@ -225,27 +230,15 @@ def coroutine(func):
 
 
 @coroutine
-def analog_threshold(names, threshold, debounce, target):
-    coroutine = extract_edges(names, [0]*len(names), debounce, target)
+def analog_threshold(threshold, debounce, target):
+    coroutine = extract_edges(0, debounce, target)
     while True:
         samples = (yield)
         coroutine.send(samples >= threshold)
 
 
 @coroutine
-def extract_edges(names, initial_states, min_samples, target):
-    coroutines = []
-    for name, initial_state in zip(names, initial_states):
-        c = _extract_edges(name, initial_state, min_samples, target)
-        coroutines.append(c)
-    while True:
-        new_samples = (yield)
-        for cr, line_samples in zip(coroutines, new_samples):
-            cr.send(line_samples)
-
-
-@coroutine
-def _extract_edges(name, initial_state, min_samples, target):
+def extract_edges(initial_state, min_samples, target):
     if min_samples < 1:
         raise ValueError('min_samples must be greater than 1')
     prior_samples = np.tile(initial_state, min_samples)
@@ -263,14 +256,14 @@ def _extract_edges(name, initial_state, min_samples, target):
                     continue
                 edge = 'rising' if samples[tlb] == 1 else 'falling'
                 initial_state = samples[tlb]
-                target(name, edge, t_prior + tlb)
+                target(edge, t_prior + tlb)
 
         t_prior += new_samples.shape[-1]
         prior_samples = samples[..., -min_samples:]
 
 
 @coroutine
-def capture_epoch(names, start, duration, callback):
+def capture_epoch(start, duration, callback):
     '''
     Coroutine to facilitate epoch acquisition
     '''
@@ -287,7 +280,7 @@ def capture_epoch(names, start, duration, callback):
             # We have missed the start of the epoch. Notify the callback of this
             log.debug('Missed samples for epoch of %d samples starting at %d',
                       start, duration)
-            callback(names, start, duration, None)
+            callback(start, duration, None)
             break
         elif current_start <= (tlb + samples):
             # The start of the epoch is somewhere inside `data`. Find the start
@@ -308,17 +301,17 @@ def capture_epoch(names, start, duration, callback):
             # (duration < 0 means that something happened and we can't recover.
             if remaining_duration == 0:
                 accumulated_data = np.concatenate(accumulated_data, axis=-1)
-                callback(names, start, duration, accumulated_data)
+                callback(start, duration, accumulated_data)
                 break
             elif remaining_duration < 0:
                 log.debug('Acquired too many samples for epoch of %d samples '
                           'starting at %d', start, duration)
-                callback(names, start, duration, None)
+                callback(start, duration, None)
                 break
 
 
 @coroutine
-def extract_epochs(names, queue, callback, buffer_samples):
+def extract_epochs(queue, callback, buffer_samples):
     '''
     Parameters
     ----------
@@ -343,7 +336,7 @@ def extract_epochs(names, queue, callback, buffer_samples):
         # provided in seconds, but we need to convert this to number of samples.
         while not queue.empty():
             start, duration = queue.get()
-            epoch_coroutine = capture_epoch(names, start, duration, callback)
+            epoch_coroutine = capture_epoch(start, duration, callback)
             # Go through the data we've been caching to facilitate historical
             # acquisition of data.
             epoch_coroutines.append(epoch_coroutine)
@@ -464,37 +457,24 @@ def setup_event_timer(trigger, counter, clock, callback=None, edge='rising'):
 
 
 def setup_change_detect_callback(lines, callback, timer, names=None):
-    # Since the user may have specified a range of lines (e.g.,
-    # 'Dev1/port0/line0:1') or listed each line individually (e.g.,
-    # 'Dev1/port0/line0, Dev1/port0/line1'), we need to extract the individual
-    # lines in the task. This allows the callback helper to report the name of
-    # the line on which the event was detected.
-    lines = channel_list(lines, 'digital')
-    if names is not None:
-        if len(names) != len(lines):
-            raise ValueError('Number of names must match number of lines')
-    else:
-        names = lines
-
     task = create_task('change_detect')
-    line_string = ','.join(lines)
-    mx.DAQmxCreateDIChan(task, line_string, '', mx.DAQmx_Val_ChanForAllLines)
+    mx.DAQmxCreateDIChan(task, lines, '', mx.DAQmx_Val_ChanForAllLines)
 
     # Get the current state of the lines so that we know what happened during
     # the first change detection event.
     mx.DAQmxStartTask(task)
-    initial_state = read_digital_lines(task, 1)
+    initial_state = read_digital_lines(task, 1).ravel()
     mx.DAQmxStopTask(task)
 
     # If we're using change detection timing on the digital lines, there's no
     # point in reading them in as a hardware-timed buffered task. Given the
     # event times, we can always reconstruct the state of the line at any given
     # time.
-    mx.DAQmxCfgChangeDetectionTiming(task, line_string, line_string,
+    mx.DAQmxCfgChangeDetectionTiming(task, lines, lines,
                                      mx.DAQmx_Val_ContSamps, 200)
     mx.DAQmxCfgInputBuffer(task, 0)
 
-    cb = ChangeDetectionCallbackHelper(names, callback, initial_state, timer)
+    cb = ChangeDetectionCallbackHelper(callback, initial_state, timer)
     cb_ptr = mx.DAQmxSignalEventCallbackPtr(cb)
     mx.DAQmxRegisterSignalEvent(task, mx.DAQmx_Val_ChangeDetectionEvent, 0,
                                 cb_ptr, None)
@@ -840,6 +820,7 @@ class Engine(object):
         # event timer. Right now we don't want to deal with multi-device event
         # timers. If there's more than one device, then we should configure each
         # separately.
+        names = channel_names('digital', lines, names)
         devices = device_list(lines, 'digital')
         if len(devices) != 1:
             raise ValueError('Cannot configure multi-device event timer')
@@ -849,22 +830,27 @@ class Engine(object):
         et_task = setup_event_timer(trigger, counter, clock)
         cd_task = setup_change_detect_callback(lines, self._et_fired, et_task,
                                                names)
+        cd_task._names = names
         self._tasks['et_task'] = et_task
         self._tasks['cd_task'] = cd_task
 
-    def register_ao_callback(self, callback):
-        self._callbacks.setdefault('ao', []).append(callback)
+    def register_ao_callback(self, callback, name):
+        i = self._tasks['hw_ao']._names.index(name)
+        self._callbacks.setdefault('ao', []).append((i, callback))
 
-    def register_ai_callback(self, callback):
-        self._callbacks.setdefault('ai', []).append(callback)
+    def register_ai_callback(self, callback, name):
+        i = self._tasks['hw_ai']._names.index(name)
+        self._callbacks.setdefault('ai', []).append((i, callback))
 
-    def register_di_callback(self, callback):
-        self._callbacks.setdefault('di', []).append(callback)
+    def register_di_callback(self, callback, name):
+        i = self._tasks['hw_di']._names.index(name)
+        self._callbacks.setdefault('di', []).append((i, callback))
 
-    def register_et_callback(self, callback):
-        self._callbacks.setdefault('et', []).append(callback)
+    def register_et_callback(self, callback, name):
+        i = self._tasks['cd_task']._names.index(name)
+        self._callbacks.setdefault('et', []).append((i, callback))
 
-    def register_ai_epoch_callback(self, callback, queue, buffer_size=60):
+    def register_ai_epoch_callback(self, callback, name, queue, buffer_size=60):
         '''
         Configure epoch-based acquisition. The queue will be used to provide the
         start time and duration of epochs (in seconds) that should be captured
@@ -894,20 +880,21 @@ class Engine(object):
         queue.put((35, 10))
         '''
         task = self._tasks['hw_ai']
+        i = task._names.index(name)
         buffer_samples = int(buffer_size*task._fs)
-        generator = extract_epochs(task._names, queue, callback,
-                                   buffer_samples)
-        self._callbacks.setdefault('ai_epoch', []).append(generator)
+        cr = extract_epochs(queue, callback, buffer_samples)
+        self._callbacks.setdefault('ai', []).append((i, cr.send))
 
-    def register_ai_threshold_callback(self, callback, threshold, debounce=1):
+    def register_ai_threshold_callback(self, callback, name, threshold,
+                                       debounce=1):
         '''
         Configure threshold detection on hardware-timed analog inputs.
         '''
-        names = self._tasks['hw_ai']._names
-        coroutine = analog_threshold(names, threshold, debounce, callback)
-        self._callbacks.setdefault('ai_threshold', []).append(coroutine)
+        i = self._tasks['hw_ai']._names.index(name)
+        cr = analog_threshold(threshold, debounce, callback)
+        self._callbacks.setdefault('ai', []).append((i, cr.send))
 
-    def register_di_change_callback(self, callback, debounce=1):
+    def register_di_change_callback(self, callback, name, debounce=1):
         '''
         Configure change detection on hardware-timed digital inputs.
 
@@ -922,9 +909,9 @@ class Engine(object):
             the change is recorded. Set to 1 for no debouncing.
         '''
         task = self._tasks['hw_di']
-        generator = extract_edges(task._names, task._initial_state, debounce,
-                                  callback)
-        self._callbacks.setdefault('di_edges', []).append(generator)
+        i = task._names.index(name)
+        cr = extract_edges(task._initial_state[i], debounce, callback)
+        self._callbacks.setdefault('di', []).append((i, cr.send))
 
     def write_hw_ao(self, data, offset=None):
         task = self._tasks['hw_ao']
@@ -984,30 +971,22 @@ class Engine(object):
         timer = Timer(duration, lambda: self.set_sw_do(name, 0))
         timer.start()
 
-    def _et_fired(self, change, line, event_time):
-        for cb in self._callbacks.get('et', []):
-            cb(change, line, event_time)
+    def _et_fired(self, line_index, change, event_time):
+        for i, cb in self._callbacks.get('et', []):
+            if i == line_index:
+                cb(change, event_time)
 
     def _hw_ai_callback(self, samples):
-        task = self._tasks['hw_ai']
-        for cb in self._callbacks.get('ai', []):
-            cb(task._names, samples)
-        for generator in self._callbacks.get('ai_epoch', []):
-            generator.send(samples)
-        for generator in self._callbacks.get('ai_threshold', []):
-            generator.send(samples)
+        for i, cb in self._callbacks.get('ai', []):
+            cb(samples[i])
 
     def _hw_di_callback(self, samples):
-        task = self._tasks['hw_di']
-        for cb in self._callbacks.get('di', []):
-            cb(task._names, samples)
-        for generator in self._callbacks.get('di_edges', []):
-            generator.send(samples)
+        for i, cb in self._callbacks.get('di', []):
+            cb(samples[i])
 
     def _hw_ao_callback(self, offset, samples):
-        names = self._tasks['hw_ao']._names
-        for cb in self._callbacks.get('ao', []):
-            cb(names, offset, samples)
+        for i, cb in self._callbacks.get('ao', []):
+            cb(offset, samples)
 
     def start(self):
         if 'hw_ao' in self._tasks:

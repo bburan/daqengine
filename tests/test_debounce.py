@@ -6,7 +6,7 @@ from daqengine.ni import extract_edges
 
 def test_extract_edges():
 
-    def accumulator(name, edge, ts):
+    def accumulator(edge, ts):
         edges.append(edge)
         timestamps.append(ts)
 
@@ -52,12 +52,11 @@ def test_extract_edges():
         for min_samples in (1, 2, 3):
             edges = []
             timestamps = []
-            extractor = extract_edges(['a'],
-                                      initial_states=[initial_state],
+            extractor = extract_edges(initial_state=initial_state,
                                       min_samples=min_samples,
                                       target=accumulator)
             for line in dio:
-                extractor.send([line])
+                extractor.send(line)
 
             assert expected[initial_state, min_samples]['edges'] == edges
             assert expected[initial_state, min_samples]['timestamps'] \

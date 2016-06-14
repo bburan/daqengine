@@ -1,4 +1,6 @@
 import unittest
+
+from functools import partial
 import numpy as np
 
 from daqengine.ni import analog_threshold
@@ -37,7 +39,14 @@ def test_analog_threshold():
     for threshold in (2.5, 2.75, 3.1):
         for debounce in (2, 3):
             results = []
-            extractor = analog_threshold(['a', 'b'], threshold, debounce,
-                                         accumulator)
-            extractor.send(analog)
+            # This demonstrates how thresholding on each channel can be
+            # configured independently (e.g., as done in psiexperiment), yet
+            # share a common callback.
+            a_accumulator = partial(accumulator, 'a')
+            b_accumulator = partial(accumulator, 'b')
+            extractor = analog_threshold(threshold, debounce, a_accumulator)
+            extractor.send(analog[0])
+            extractor = analog_threshold(threshold, debounce, b_accumulator)
+            extractor.send(analog[1])
+
             assert set(expected[threshold, debounce]) == set(results)

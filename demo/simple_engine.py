@@ -1,3 +1,5 @@
+from functools import partial
+
 import Queue
 import numpy as np
 
@@ -11,40 +13,56 @@ def main(device):
     (TBSI)-specific logic. This enables us to write code that does not care
     whether it's communicating with a NI or MCC device.
     '''
-    def ao_callback(names, offset, samples):
-        print('{} samples needed at {} for {}'.format(samples, offset, names))
+    def ao_callback(offset, samples):
+        print('{} samples needed at {}'.format(samples, offset, name))
         engine.write_hw_ao(np.zeros(samples))
 
-    def ai_callback(names, data):
-        print('{} samples acquired from {}'.format(data.shape[-1], names))
+    def ai_callback(name, data):
+        print('{} samples acquired from {}'.format(data.shape, name))
 
-    def et_callback(change, line, event_time):
-        print('{} edge on {} at {}'.format(change, line, event_time))
-        queue.put((event_time-100, 100))
+    def et_callback(name, change, event_time):
+        print('{} edge on {} at {}'.format(change, name, event_time))
+        if change == 'rising':
+            if name == 'port0/line0':
+                queue_0.put((event_time-100, 100))
+            elif name == 'port0/line1':
+                queue_1.put((event_time-100, 100))
 
-    def ai_epoch_callback(names, start, duration, data):
+    def ai_epoch_callback(name, start, duration, data):
         print('Epoch {} acquired with {} samples from {}' \
-              .format(start, data.shape, names))
+              .format(start, data.shape, name))
 
-    queue = Queue.Queue()
+    queue_0 = Queue.Queue()
+    queue_1 = Queue.Queue()
     engine = Engine()
 
     # Set the polling interval to a high value to minimize clutter on the scren.
     engine.hw_ao_monitor_period = 5
     engine.hw_ai_monitor_period = 5
-    engine.configure_hw_ai(1e3, '/{}/ai0:2'.format(device), (-10, 10),
-                           sync_ao=False)
+    engine.configure_hw_ai(1e3, '/{}/ai0:2'.format(device), (-10, 10))
     engine.configure_hw_ao(1e3, '/{}/ao0'.format(device), (-10, 10))
     engine.configure_et('/{}/port0/line0:7'.format(device), 'ao/SampleClock')
 
-    engine.register_ao_callback(ao_callback)
-    engine.register_ai_callback(ai_callback)
-    engine.register_et_callback(et_callback)
-    engine.register_ai_epoch_callback(ai_epoch_callback, queue)
+    for name in ('ai0', 'ai1', 'ai2'):
+        channel = '{}/{}'.format(device, name) 
+        engine.register_ai_callback(partial(ai_callback, name), channel)
 
-    queue.put((0, 100))
-    queue.put((15, 100))
-    queue.put((55, 100))
+    # Here, we don't bother providing the name of the channel because this type
+    # of callback only supports one task.
+    engine.register_ao_callback(ao_callback, 'Dev1/ao0')
+    engine.register_et_callback(partial(et_callback, 'port0/line0'),
+                                '{}/port0/line0'.format(device))
+    engine.register_et_callback(partial(et_callback, 'port0/line1'),
+                                '{}/port0/line1'.format(device))
+    engine.register_ai_epoch_callback(partial(ai_epoch_callback, 'ai0'),
+                                      '{}/ai0'.format(device), queue_0)
+    engine.register_ai_epoch_callback(partial(ai_epoch_callback, 'ai1'),
+                                      '{}/ai1'.format(device), queue_1)
+
+    queue_0.put((0, 100))
+    queue_0.put((15, 100))
+    queue_0.put((55, 100))
+    queue_1.put((60, 150))
 
     engine.start()
     raw_input('Demo running. Hit enter to exit.\n')
