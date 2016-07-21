@@ -119,27 +119,12 @@ class CallbackHelper(object):
 
 class SamplesGeneratedCallbackHelper(object):
 
-    def __init__(self, callback, n_channels):
+    def __init__(self, callback):
         self._callback = callback
-        self._n_channels = n_channels
-        self._uint64 = ctypes.c_uint64()
-        self._uint32 = ctypes.c_uint32()
 
     def __call__(self, task, event_type, callback_samples, callback_data):
         try:
-            mx.DAQmxSetWriteRelativeTo(task, mx.DAQmx_Val_CurrWritePos)
-            mx.DAQmxSetWriteOffset(task, 0)
-            mx.DAQmxGetWriteCurrWritePos(task, self._uint64)
-            offset = self._uint64.value
-            mx.DAQmxGetWriteTotalSampPerChanGenerated(task, self._uint64)
-            generated = self._uint64.value
-            mx.DAQmxGetWriteSpaceAvail(task, self._uint32)
-            available = self._uint32.value
-            log.trace('Current write position %d', offset)
-            log.trace('Total s/chan generated %d', generated)
-            log.trace('Current write space available %d', available)
-            if self._uint32.value != 0:
-                self._callback(offset, available)
+            self._callback()
             return 0
         except Exception as e:
             log.exception(e)
@@ -151,15 +136,27 @@ class SamplesAcquiredCallbackHelper(object):
     def __init__(self, callback, n_channels):
         self._callback = callback
         self._n_channels = n_channels
-        self._samples_read_ptr = ctypes.c_int32()
+        self._int32 = ctypes.c_int32()
+        self._uint32 = ctypes.c_uint32()
 
     def __call__(self, task, event_type, callback_samples, callback_data):
         try:
-            data = np.empty((self._n_channels, callback_samples))
-            mx.DAQmxReadAnalogF64(task, callback_samples, 0,
-                                  mx.DAQmx_Val_GroupByChannel, data, data.size,
-                                  self._samples_read_ptr, None)
-            self._callback(data)
+            mx.DAQmxGetReadAvailSampPerChan(task, self._uint32)
+            available_samples = self._uint32.value
+            sample_blocks = int(available_samples/callback_samples)
+            samples_to_read = sample_blocks*callback_samples
+            if __debug__:
+                log.trace('{} s/channel acquired'.format(self._uint32.value))
+                log.trace('Reading {} s/channel'.format(samples_to_read))
+            if samples_to_read > 0:
+                mx.DAQmxGetReadAvailSampPerChan(task, self._uint32)
+                data = np.empty((self._n_channels, samples_to_read),
+                                dtype=np.double)
+                mx.DAQmxReadAnalogF64(task, samples_to_read, 0,
+                                      mx.DAQmx_Val_GroupByChannel, data,
+                                      data.size, self._int32, None)
+                self._callback(data)
+                available_samples -= callback_samples
             return 0
         except Exception as e:
             log.exception(e)
@@ -508,12 +505,13 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples,
     mx.DAQmxGetTaskNumChans(task, result)
     n_channels = result.value
 
-    callback_helper = SamplesGeneratedCallbackHelper(callback, n_channels)
+    callback_helper = SamplesGeneratedCallbackHelper(callback)
     cb_ptr = mx.DAQmxEveryNSamplesEventCallbackPtr(callback_helper)
     mx.DAQmxRegisterEveryNSamplesEvent(task,
                                        mx.DAQmx_Val_Transferred_From_Buffer,
                                        int(callback_samples), 0, cb_ptr, None)
     task._cb_ptr = cb_ptr
+    mx.DAQmxTaskControl(task, mx.DAQmx_Val_Task_Commit)
     return task
 
 
@@ -553,12 +551,17 @@ def setup_timing(task, fs, samples=np.inf, start_trigger=None):
                              sample_mode, samples)
 
 
+mode_map = {
+    'RSE': mx.DAQmx_Val_RSE,
+    'differential': mx.DAQmx_Val_Diff,
+}
+
 def setup_hw_ai(fs, lines, expected_range, callback, callback_samples,
-                start_trigger=None):
+                start_trigger=None, mode='RSE'):
     # Record AI filter delay
     task = create_task('hw_ai')
     lb, ub = expected_range
-    mx.DAQmxCreateAIVoltageChan(task, lines, '', mx.DAQmx_Val_RSE, lb, ub,
+    mx.DAQmxCreateAIVoltageChan(task, lines, '', mode_map[mode], lb, ub,
                                 mx.DAQmx_Val_Volts, '')
     setup_timing(task, fs, np.inf, start_trigger)
 
@@ -572,8 +575,12 @@ def setup_hw_ai(fs, lines, expected_range, callback, callback_samples,
               lines, buffer_size)
     log.debug('%d channels in task', n_channels)
 
-    new_buffer_size = np.ceil(buffer_size/callback_samples)*callback_samples
+    new_buffer_size = np.ceil(buffer_size/callback_samples)*callback_samples*10
     mx.DAQmxSetBufInputBufSize(task, int(new_buffer_size))
+
+    mx.DAQmxGetBufInputBufSize(task, result)
+    buffer_size = result.value
+    log.debug('Buffer size for %s set to %d samples', lines, buffer_size)
 
     callback_helper = SamplesAcquiredCallbackHelper(callback, n_channels)
     cb_ptr = mx.DAQmxEveryNSamplesEventCallbackPtr(callback_helper)
@@ -743,6 +750,7 @@ class Engine(object):
         task = setup_hw_ao(fs, lines, expected_range, self._hw_ao_callback,
                            callback_samples, start_trigger)
         task._names = channel_names('ao', lines, names)
+        task._fs = fs
         self._tasks['hw_ao'] = task
 
         mx.DAQmxGetBufOutputBufSize(self._tasks['hw_ao'], self._uint32)
@@ -750,10 +758,10 @@ class Engine(object):
         log.info('AO buffer size {} samples'.format(self.hw_ao_buffer_samples))
 
     def configure_hw_ai(self, fs, lines, expected_range, names=None,
-                        trigger=None):
+                        trigger=None, mode='RSE'):
         callback_samples = int(self.hw_ai_monitor_period*fs)
         task = setup_hw_ai(fs, lines, expected_range, self._hw_ai_callback,
-                           callback_samples, trigger)
+                           callback_samples, trigger, mode)
         task._fs = fs
         task._names = channel_names('ai', lines, names)
         self._tasks['hw_ai'] = task
@@ -773,6 +781,7 @@ class Engine(object):
         task, clock_task = setup_hw_di(fs, lines, self._hw_di_callback,
                                        callback_samples, trigger, clock)
         task._names = names
+        task._fs = fs
         if clock_task is not None:
             self._tasks['hw_di_clock'] = clock_task
         self._tasks['hw_di'] = task
@@ -820,6 +829,8 @@ class Engine(object):
         # event timer. Right now we don't want to deal with multi-device event
         # timers. If there's more than one device, then we should configure each
         # separately.
+
+        # TODO: How to determine sampling rate of task?
         names = channel_names('digital', lines, names)
         devices = device_list(lines, 'digital')
         if len(devices) != 1:
@@ -890,8 +901,21 @@ class Engine(object):
         '''
         Configure threshold detection on hardware-timed analog inputs.
         '''
-        i = self._tasks['hw_ai']._names.index(name)
-        cr = analog_threshold(threshold, debounce, callback)
+        task = self._tasks['hw_ai']
+        i = task._names.index(name)
+        fs = task._fs
+
+        class ConvertTimestampWrapper(object):
+
+            def __init__(self, fs, callback):
+                self.fs = fs
+                self.callback = callback
+
+            def __call__(self, edge, timestamp):
+                return self.callback(edge, timestamp/self.fs)
+
+        wrapper = ConvertTimestampWrapper(fs, callback)
+        cr = analog_threshold(threshold, debounce, wrapper)
         self._callbacks.setdefault('ai', []).append((i, cr.send))
 
     def register_di_change_callback(self, callback, name, debounce=1):
@@ -926,11 +950,22 @@ class Engine(object):
             mx.DAQmxSetWriteRelativeTo(task, mx.DAQmx_Val_CurrWritePos)
             mx.DAQmxSetWriteOffset(task, 0)
             log.trace('Writing %d samples to end of buffer', data.size)
+
+        if __debug__:
+            mx.DAQmxGetWriteSpaceAvail(task, self._uint32)
+            available = self._uint32.value
+            log.trace('Before: current write space available %d', available)
+
         mx.DAQmxWriteAnalogF64(task, data.shape[-1], False, 0,
                                mx.DAQmx_Val_GroupByChannel,
                                data.astype(np.float64), self._int32, None)
         if self._int32.value != data.shape[-1]:
             raise ValueError('Unable to write all samples to channel')
+
+        if __debug__:
+            mx.DAQmxGetWriteSpaceAvail(task, self._uint32)
+            available = self._uint32.value
+            log.trace('After: current write space available %d', available)
 
     def write_sw_ao(self, state):
         task = self._tasks['sw_ao']
@@ -978,25 +1013,36 @@ class Engine(object):
 
     def _hw_ai_callback(self, samples):
         for i, cb in self._callbacks.get('ai', []):
-            cb(samples[i])
+            try:
+                cb(samples[i])
+            except StopIteration:
+                log.warning('Callback no longer works. Removing.')
+                self._callbacks.get('ai').remove((i, cb))
 
     def _hw_di_callback(self, samples):
         for i, cb in self._callbacks.get('di', []):
             cb(samples[i])
 
-    def _hw_ao_callback(self, offset, samples):
+    def _hw_ao_callback(self):
         for i, cb in self._callbacks.get('ao', []):
-            cb(offset, samples)
+            cb()
 
     def start(self):
         if 'hw_ao' in self._tasks:
-            self._hw_ao_callback(0, self.hw_ao_buffer_samples)
+            self._hw_ao_callback()
         for task in self._tasks.values():
             mx.DAQmxStartTask(task)
 
     def stop(self):
         for task in self._tasks.values():
             mx.DAQmxStopTask(task)
+
+    def ao_write_position(self):
+        task = self._tasks['hw_ao']
+        mx.DAQmxSetWriteRelativeTo(task, mx.DAQmx_Val_CurrWritePos)
+        mx.DAQmxSetWriteOffset(task, 0)
+        mx.DAQmxGetWriteCurrWritePos(task, self._uint64)
+        return self._uint64.value
 
     def ao_write_space_available(self, offset=None):
         try:
