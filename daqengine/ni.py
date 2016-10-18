@@ -504,7 +504,9 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples,
     result = ctypes.c_uint32()
     mx.DAQmxGetTaskNumChans(task, result)
     n_channels = result.value
+    log.debug('%d channels in task', n_channels)
 
+    log.debug('Creating callback after every %d samples', callback_samples)
     callback_helper = SamplesGeneratedCallbackHelper(callback)
     cb_ptr = mx.DAQmxEveryNSamplesEventCallbackPtr(callback_helper)
     mx.DAQmxRegisterEveryNSamplesEvent(task,
@@ -512,6 +514,7 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples,
                                        int(callback_samples), 0, cb_ptr, None)
     task._cb_ptr = cb_ptr
     mx.DAQmxTaskControl(task, mx.DAQmx_Val_Task_Commit)
+
     return task
 
 
@@ -1028,9 +1031,12 @@ class Engine(object):
             cb()
 
     def start(self):
+        log.debug('Starting NIDAQmx engine')
         if 'hw_ao' in self._tasks:
+            log.debug('Calling HW ao callback before starting tasks')
             self._hw_ao_callback()
         for task in self._tasks.values():
+            log.debug('Starting task {}'.format(task))
             mx.DAQmxStartTask(task)
 
     def stop(self):
@@ -1064,4 +1070,5 @@ class Engine(object):
     def ao_sample_clock(self):
         task = self._tasks['hw_ao']
         mx.DAQmxGetWriteTotalSampPerChanGenerated(task, self._uint64)
+        log.trace('%d samples per channel generated', self._uint64.value)
         return self._uint64.value
