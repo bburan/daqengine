@@ -247,7 +247,7 @@ def _extract_edges(name, initial_state, min_samples, target):
         new_samples = (yield)
         samples = np.r_[prior_samples, new_samples]
         ts_change = np.flatnonzero(np.diff(samples, axis=-1)) + 1
-        ts_change = np.r_[ts_change, samples.shape[-1]] 
+        ts_change = np.r_[ts_change, samples.shape[-1]]
 
         for tlb, tub in zip(ts_change[:-1], ts_change[1:]):
             if (tub-tlb) >= min_samples:
@@ -496,13 +496,18 @@ def setup_change_detect_callback(lines, callback, timer, names=None):
     return task
 
 
-def setup_hw_ao(fs, lines, expected_range, callback, callback_samples):
+def setup_hw_ao(fs, lines, expected_range, callback, callback_samples,
+                terminal_mode=None):
+
     # TODO: DAQmxSetAOTermCfg
     task = create_task()
     lb, ub = expected_range
     mx.DAQmxCreateAOVoltageChan(task, lines, '', lb, ub, mx.DAQmx_Val_Volts, '')
     mx.DAQmxCfgSampClkTiming(task, '', fs, mx.DAQmx_Val_Rising,
                              mx.DAQmx_Val_ContSamps, int(fs))
+
+    if terminal_mode is not None:
+        mx.DAQmxSetAOTermCfg(task, lines, terminal_mode)
 
     # This controls how quickly we can update the buffer on the device. On some
     # devices it is not user-settable. On the X-series PCIe-6321 I am able to
@@ -529,34 +534,35 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples):
     return task
 
 
-def setup_hw_ai(fs, lines, expected_range, callback, callback_samples, sync_ao):
-    # Record AI filter delay
+def setup_hw_ai(fs, lines, expected_range, callback, callback_samples,
+                start_trigger, terminal_mode, terminal_coupling):
+
     task = create_task()
     lb, ub = expected_range
-    mx.DAQmxCreateAIVoltageChan(task, lines, '', mx.DAQmx_Val_RSE, lb, ub,
+    mx.DAQmxCreateAIVoltageChan(task, lines, '', terminal_mode, lb, ub,
                                 mx.DAQmx_Val_Volts, '')
-    if sync_ao:
-        mx.DAQmxCfgDigEdgeStartTrig(task, 'ao/StartTrigger',
-                                    mx.DAQmx_Val_Rising)
-        mx.DAQmxCfgSampClkTiming(task, 'ao/SampleClock', fs,
-                                 mx.DAQmx_Val_Rising, mx.DAQmx_Val_ContSamps,
-                                 int(fs))
-    else:
-        mx.DAQmxCfgSampClkTiming(task, '', fs, mx.DAQmx_Val_Rising,
-                                 mx.DAQmx_Val_ContSamps, int(fs))
+
+    if terminal_coupling is not None:
+        mx.DAQmxSetAICoupling(task, lines, terminal_coupling)
+
+    if start_trigger is not None:
+        mx.DAQmxCfgDigEdgeStartTrig(task, start_trigger, mx.DAQmx_Val_Rising)
+    mx.DAQmxCfgSampClkTiming(task, '', fs, mx.DAQmx_Val_Rising,
+                             mx.DAQmx_Val_ContSamps, int(fs))
 
     result = ctypes.c_uint32()
-    mx.DAQmxGetBufInputBufSize(task, result)
-    buffer_size = result.value
+    #mx.DAQmxGetBufInputBufSize(task, result)
+    #buffer_size = result.value
     mx.DAQmxGetTaskNumChans(task, result)
     n_channels = result.value
 
-    log.debug('Buffer size for %s automatically allocated as %d samples',
-              lines, buffer_size)
-    log.debug('%d channels in task', n_channels)
+    #log.debug('Buffer size for %s automatically allocated as %d samples',
+    #          lines, buffer_size)
+    #log.debug('%d channels in task', n_channels)
 
-    new_buffer_size = np.ceil(buffer_size/callback_samples)*callback_samples
-    mx.DAQmxSetBufInputBufSize(task, int(new_buffer_size))
+    #new_buffer_size = np.ceil(buffer_size/callback_samples)*callback_samples
+    #mx.DAQmxSetBufInputBufSize(task, int(new_buffer_size))
+    #n_channels = 1
 
     callback_helper = SamplesAcquiredCallbackHelper(callback, n_channels)
     cb_ptr = mx.DAQmxEveryNSamplesEventCallbackPtr(callback_helper)
@@ -571,7 +577,7 @@ def setup_hw_di(fs, lines, callback, callback_samples, clock=None):
     '''
     M series DAQ cards do not have onboard timing engines for digital IO.
     Therefore, we have to create one (e.g., using a counter or by using the
-    analog input or output sample clock. 
+    analog input or output sample clock.
     '''
     task = create_task()
     mx.DAQmxCreateDIChan(task, lines, '', mx.DAQmx_Val_ChanForAllLines)
@@ -693,7 +699,8 @@ class Engine(object):
         self._uint64 = ctypes.c_uint64()
         self._int32 = ctypes.c_int32()
 
-    def configure_hw_ao(self, fs, lines, expected_range, names=None):
+    def configure_hw_ao(self, fs, lines, expected_range, names=None,
+                        terminal_mode=None):
         '''
         Initialize hardware-timed analog output
 
@@ -711,7 +718,7 @@ class Engine(object):
             expected range of the signal.
         '''
         task = setup_hw_ao(fs, lines, expected_range, self._hw_ao_callback,
-                           int(self.hw_ao_monitor_period*fs))
+                           int(self.hw_ao_monitor_period*fs), terminal_mode)
         task._names = channel_names('ao', lines, names)
         self._tasks['hw_ao'] = task
 
@@ -719,9 +726,13 @@ class Engine(object):
         self.hw_ao_buffer_samples = self._uint32.value
         log.info('AO buffer size {} samples'.format(self.hw_ao_buffer_samples))
 
-    def configure_hw_ai(self, fs, lines, expected_range, names=None, sync_ao=True):
+    def configure_hw_ai(self, fs, lines, expected_range, names=None,
+                        start_trigger=None, terminal_mode=None,
+                        terminal_coupling=None):
+
         task = setup_hw_ai(fs, lines, expected_range, self._hw_ai_callback,
-                           int(self.hw_ai_monitor_period*fs), sync_ao)
+                           int(self.hw_ai_monitor_period*fs), start_trigger,
+                           terminal_mode, terminal_coupling)
         task._fs = fs
         task._names = channel_names('ai', lines, names)
         self._tasks['hw_ai'] = task
