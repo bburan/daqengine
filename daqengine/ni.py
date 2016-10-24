@@ -369,6 +369,42 @@ def extract_epochs(queue, callback, buffer_samples):
 ################################################################################
 # configuration
 ################################################################################
+def setup_timing(task, fs, samples=np.inf, start_trigger=None):
+    '''
+    Configures timing for task
+
+    Parameters
+    ----------
+    task : niDAQmx task handle
+        Task to configure timing for
+    fs : string or float
+        If string, must be the name of a sample clock (e.g. ao/SampleClock) that
+        the acquistion will be tied to. If float, the internal sample clock for
+        that task will be used and the sample rate will be set to fs.
+    samples :  float
+        If infinite, the task will be set to continuous acquistion. If finite,
+        the task will be set to acquire the specified number of samples.
+    start_trigger : string
+        Name of digtial line to start acquisition on. Can be set to any PFI line
+        or to one of the analog sources (e.g., ao/StartTrigger or
+        ai/StartTrigger).
+    '''
+    if start_trigger:
+        mx.DAQmxCfgDigEdgeStartTrig(task, start_trigger, mx.DAQmx_Val_Rising)
+    if isinstance(fs, basestring):
+        sample_clock = fs
+        fs = 200e3
+    else:
+        sample_clock = ''
+    if samples is np.inf:
+        sample_mode = mx.DAQmx_Val_ContSamps
+        samples = int(fs)
+    else:
+        sample_mode = mx.DAQmx_Val_FiniteSamps
+    mx.DAQmxCfgSampClkTiming(task, sample_clock, fs, mx.DAQmx_Val_Rising,
+                             sample_mode, samples)
+
+
 def create_task(name=None):
     '''
     Create niDAQmx task
@@ -482,7 +518,7 @@ def setup_change_detect_callback(lines, callback, timer, names=None):
 
 
 def setup_hw_ao(fs, lines, expected_range, callback, callback_samples,
-                terminal_mode=None):
+                start_trigger=None, terminal_mode=None):
 
     # TODO: DAQmxSetAOTermCfg
     task = create_task('hw_ao')
@@ -493,17 +529,20 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples,
     if terminal_mode is not None:
         mx.DAQmxSetAOTermCfg(task, lines, terminal_mode)
 
+    if start_trigger:
+        mx.DAQmxCfgDigEdgeStartTrig(task, start_trigger, mx.DAQmx_Val_Rising)
+
     # This controls how quickly we can update the buffer on the device. On some
     # devices it is not user-settable. On the X-series PCIe-6321 I am able to
     # change it. On the M-xeries PCI 6259 it appears to be fixed at 8191
     # samples.
-    mx.DAQmxSetBufOutputOnbrdBufSize(task, 8191)
+    #mx.DAQmxSetBufOutputOnbrdBufSize(task, 8191)
 
     # If the write reaches the end of the buffer and no new data has been
     # provided, do not loop around to the beginning and start over.
     mx.DAQmxSetWriteRegenMode(task, mx.DAQmx_Val_DoNotAllowRegen)
 
-    mx.DAQmxSetBufOutputBufSize(task, int(callback_samples*100))
+    mx.DAQmxSetBufOutputBufSize(task, int(callback_samples*10))
 
     result = ctypes.c_uint32()
     mx.DAQmxGetTaskNumChans(task, result)
@@ -533,8 +572,10 @@ def setup_hw_ai(fs, lines, expected_range, callback, callback_samples,
     if terminal_coupling is not None:
         mx.DAQmxSetAICoupling(task, lines, terminal_coupling)
 
-    if start_trigger is not None:
+    print(start_trigger)
+    if start_trigger:
         mx.DAQmxCfgDigEdgeStartTrig(task, start_trigger, mx.DAQmx_Val_Rising)
+
     mx.DAQmxCfgSampClkTiming(task, '', fs, mx.DAQmx_Val_Rising,
                              mx.DAQmx_Val_ContSamps, int(fs))
 
@@ -703,7 +744,7 @@ class Engine(object):
         self._int32 = ctypes.c_int32()
 
     def configure_hw_ao(self, fs, lines, expected_range, names=None,
-                        terminal_mode=None):
+                        start_trigger=None, terminal_mode=None):
         '''
         Initialize hardware-timed analog output
 
@@ -722,7 +763,8 @@ class Engine(object):
         '''
         callback_samples = int(self.hw_ao_monitor_period*fs)
         task = setup_hw_ao(fs, lines, expected_range, self._hw_ao_callback,
-                           int(self.hw_ao_monitor_period*fs), terminal_mode)
+                           int(self.hw_ao_monitor_period*fs), start_trigger,
+                           terminal_mode)
         task._names = channel_names('ao', lines, names)
         task._fs = fs
         self._tasks['hw_ao'] = task
