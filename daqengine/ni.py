@@ -201,7 +201,6 @@ class ChangeDetectionCallbackHelper(object):
         try:
             current_state = read_digital_lines(task).ravel()
             et = self._get_event_time()
-            print(self._prev_state, current_state)
             try:
                 for (i, (p, c)) in enumerate(zip(self._prev_state, current_state)):
                     if p != c:
@@ -424,6 +423,7 @@ def create_task(name=None):
         name = ''
     task = mx.TaskHandle(0)
     mx.DAQmxCreateTask(name, ctypes.byref(task))
+    task._name = name
     return task
 
 
@@ -564,7 +564,7 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples,
 def setup_hw_ai(fs, lines, expected_range, callback, callback_samples,
                 start_trigger, terminal_mode, terminal_coupling):
 
-    task = create_task()
+    task = create_task('hw_ai')
     lb, ub = expected_range
     mx.DAQmxCreateAIVoltageChan(task, lines, '', terminal_mode, lb, ub,
                                 mx.DAQmx_Val_Volts, '')
@@ -572,7 +572,6 @@ def setup_hw_ai(fs, lines, expected_range, callback, callback_samples,
     if terminal_coupling is not None:
         mx.DAQmxSetAICoupling(task, lines, terminal_coupling)
 
-    print(start_trigger)
     if start_trigger:
         mx.DAQmxCfgDigEdgeStartTrig(task, start_trigger, mx.DAQmx_Val_Rising)
 
@@ -955,7 +954,23 @@ class Engine(object):
         cr = extract_edges(task._initial_state[i], debounce, callback)
         self._callbacks.setdefault('di', []).append((i, cr.send))
 
-    def write_hw_ao(self, data, offset=None):
+    def unregister_ao_callback(self, callback, name):
+        i = self._tasks['hw_ao']._names.index(name)
+        self._callbacks['ao'].remove((i, callback))
+
+    def unregister_ai_callback(self, callback, name):
+        i = self._tasks['hw_ai']._names.index(name)
+        self._callbacks['ai'].remove((i, callback))
+
+    def unregister_di_callback(self, callback, name):
+        i = self._tasks['hw_di']._names.index(name)
+        self._callbacks['di'].remove((i, callback))
+
+    def unregister_et_callback(self, callback, name):
+        i = self._tasks['cd_task']._names.index(name)
+        self._callbacks['et'].remove((i, callback))
+
+    def write_hw_ao(self, data, offset=None, timeout=0):
         task = self._tasks['hw_ao']
         if offset is not None:
             # Overwrites data already in the buffer. Used to override changes to
@@ -974,7 +989,7 @@ class Engine(object):
             available = self._uint32.value
             log.trace('Before: current write space available %d', available)
 
-        mx.DAQmxWriteAnalogF64(task, data.shape[-1], False, 0,
+        mx.DAQmxWriteAnalogF64(task, data.shape[-1], False, timeout,
                                mx.DAQmx_Val_GroupByChannel,
                                data.astype(np.float64), self._int32, None)
         if self._int32.value != data.shape[-1]:
@@ -1043,7 +1058,11 @@ class Engine(object):
 
     def _hw_ao_callback(self):
         for i, cb in self._callbacks.get('ao', []):
-            cb()
+            try:
+                cb()
+            except StopIteration:
+                log.warning('Callback no longer works. Removing.')
+                self._callbacks.get('ao').remove((i, cb))
 
     def start(self):
         log.debug('Starting NIDAQmx engine')
@@ -1051,7 +1070,7 @@ class Engine(object):
             log.debug('Calling HW ao callback before starting tasks')
             self._hw_ao_callback()
         for task in self._tasks.values():
-            log.debug('Starting task {}'.format(task))
+            log.debug('Starting task {}'.format(task._name))
             mx.DAQmxStartTask(task)
 
     def stop(self):
