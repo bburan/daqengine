@@ -542,6 +542,8 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples,
     # provided, do not loop around to the beginning and start over.
     mx.DAQmxSetWriteRegenMode(task, mx.DAQmx_Val_DoNotAllowRegen)
 
+    buffer_size = int(callback_samples*10)
+    log.debug('Setting output buffer size to %d'.format(buffer_size))
     mx.DAQmxSetBufOutputBufSize(task, int(callback_samples*10))
 
     result = ctypes.c_uint32()
