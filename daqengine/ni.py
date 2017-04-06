@@ -143,16 +143,11 @@ class SamplesAcquiredCallbackHelper(object):
         try:
             mx.DAQmxGetReadAvailSampPerChan(task, self._uint32)
             available_samples = self._uint32.value
-            sample_blocks = int(available_samples/callback_samples)
-            samples_to_read = sample_blocks*callback_samples
-            if __debug__:
-                log.trace('{} s/channel acquired'.format(self._uint32.value))
-                log.trace('Reading {} s/channel'.format(samples_to_read))
-            if samples_to_read > 0:
+            while available_samples >= callback_samples:
                 mx.DAQmxGetReadAvailSampPerChan(task, self._uint32)
-                data = np.empty((self._n_channels, samples_to_read),
-                                dtype=np.double)
-                mx.DAQmxReadAnalogF64(task, samples_to_read, 0,
+                data_shape = self._n_channels, callback_samples
+                data = np.empty(data_shape, dtype=np.double)
+                mx.DAQmxReadAnalogF64(task, callback_samples, 0,
                                       mx.DAQmx_Val_GroupByChannel, data,
                                       data.size, self._int32, None)
                 self._callback(data)
