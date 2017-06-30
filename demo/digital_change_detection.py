@@ -8,7 +8,7 @@ def main(device):
     seconds, divide by 10 MHz.
     '''
     def callback(edge, line, event_time):
-        print('{} edge on {} at {}'.format(edge, line, event_time/10e6))
+        print(('{} edge on {} at {}'.format(edge, line, event_time/10e6)))
 
     timer_task = setup_event_timer('/{}/ChangeDetectionEvent'.format(device), 
                                    '/{}/Ctr0'.format(device),
@@ -19,7 +19,7 @@ def main(device):
                                            names=['spout', 'lick', 'poke'])
     mx.DAQmxStartTask(timer_task)
     mx.DAQmxStartTask(cd_task)
-    raw_input('Connect some lines from port1 to port0/line0:2. \n'
+    input('Connect some lines from port1 to port0/line0:2. \n'
               'Toggle state of port 1 lines using MAX. \n'
               'Hit enter to exit.\n')
 

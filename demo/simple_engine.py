@@ -1,6 +1,6 @@
 from functools import partial
 
-import Queue
+import queue
 import numpy as np
 
 from daqengine.ni import Engine
@@ -65,7 +65,7 @@ def main(device):
     queue_1.put((60, 150))
 
     engine.start()
-    raw_input('Demo running. Hit enter to exit.\n')
+    input('Demo running. Hit enter to exit.\n')
 
 if __name__ == '__main__':
     import sys

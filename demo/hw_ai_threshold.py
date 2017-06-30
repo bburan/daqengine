@@ -37,7 +37,7 @@ def main(device):
     engine.register_di_change_callback(cb, 'poke_digital', debounce=10)
 
     engine.start()
-    raw_input('Demo running. Hit enter to exit.\n')
+    input('Demo running. Hit enter to exit.\n')
 
 
 if __name__ == '__main__':

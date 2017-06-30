@@ -1,4 +1,4 @@
-from Queue import Queue
+from queue import Queue
 from uuid import uuid4
 
 import numpy as np

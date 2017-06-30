@@ -22,7 +22,7 @@ on this topic, see the following resources:
 
 '''
 
-from __future__ import print_function
+
 
 from collections import OrderedDict
 import ctypes
@@ -70,15 +70,15 @@ def channel_info(channels, channel_type):
                                     mx.DAQmx_Val_Cfg_Default, -10, 10,
                                     mx.DAQmx_Val_Volts, '')
 
-    channels = ctypes.create_string_buffer('', 4096)
+    channels = ctypes.create_string_buffer(b'', 4096)
     mx.DAQmxGetTaskChannels(task, channels, len(channels))
-    devices = ctypes.create_string_buffer('', 4096)
+    devices = ctypes.create_string_buffer(b'', 4096)
     mx.DAQmxGetTaskDevices(task, devices, len(devices))
     mx.DAQmxClearTask(task)
 
     return {
-        'channels': [c.strip() for c in channels.value.split(',')],
-        'devices': [d.strip() for d in devices.value.split(',')],
+        'channels': [c.strip() for c in channels.value.split(b',')],
+        'devices': [d.strip() for d in devices.value.split(b',')],
     }
 
 
@@ -143,15 +143,12 @@ class SamplesAcquiredCallbackHelper(object):
         try:
             mx.DAQmxGetReadAvailSampPerChan(task, self._uint32)
             available_samples = self._uint32.value
-            while available_samples >= callback_samples:
-                mx.DAQmxGetReadAvailSampPerChan(task, self._uint32)
-                data_shape = self._n_channels, callback_samples
-                data = np.empty(data_shape, dtype=np.double)
-                mx.DAQmxReadAnalogF64(task, callback_samples, 0,
-                                      mx.DAQmx_Val_GroupByChannel, data,
-                                      data.size, self._int32, None)
-                self._callback(data)
-                available_samples -= callback_samples
+            data_shape = self._n_channels, available_samples
+            data = np.empty(data_shape, dtype=np.double)
+            mx.DAQmxReadAnalogF64(task, available_samples, 0,
+                                    mx.DAQmx_Val_GroupByChannel, data,
+                                    data.size, self._int32, None)
+            self._callback(data)
             return 0
         except Exception as e:
             log.exception(e)
@@ -215,7 +212,7 @@ def coroutine(func):
     '''Decorator to auto-start a coroutine.'''
     def start(*args, **kwargs):
         cr = func(*args, **kwargs)
-        cr.next()
+        next(cr)
         return cr
     return start
 
@@ -385,7 +382,7 @@ def setup_timing(task, fs, samples=np.inf, start_trigger=None):
     '''
     if start_trigger:
         mx.DAQmxCfgDigEdgeStartTrig(task, start_trigger, mx.DAQmx_Val_Rising)
-    if isinstance(fs, basestring):
+    if isinstance(fs, str):
         sample_clock = fs
         fs = 200e3
     else:
@@ -513,7 +510,7 @@ def setup_change_detect_callback(lines, callback, timer, names=None):
 
 
 def setup_hw_ao(fs, lines, expected_range, callback, callback_samples,
-                start_trigger=None, terminal_mode=None):
+                start_trigger=None, terminal_mode=None, buffer_samples=None):
 
     # TODO: DAQmxSetAOTermCfg
     task = create_task('hw_ao')
@@ -527,24 +524,28 @@ def setup_hw_ao(fs, lines, expected_range, callback, callback_samples,
     if start_trigger:
         mx.DAQmxCfgDigEdgeStartTrig(task, start_trigger, mx.DAQmx_Val_Rising)
 
-    # This controls how quickly we can update the buffer on the device. On some
-    # devices it is not user-settable. On the X-series PCIe-6321 I am able to
-    # change it. On the M-xeries PCI 6259 it appears to be fixed at 8191
-    # samples.
-    #mx.DAQmxSetBufOutputOnbrdBufSize(task, 8191)
-
     # If the write reaches the end of the buffer and no new data has been
     # provided, do not loop around to the beginning and start over.
     mx.DAQmxSetWriteRegenMode(task, mx.DAQmx_Val_DoNotAllowRegen)
 
-    buffer_size = int(callback_samples*10)
-    log.debug('Setting output buffer size to %d'.format(buffer_size))
-    mx.DAQmxSetBufOutputBufSize(task, int(callback_samples*10))
+    if buffer_samples is None:
+        buffer_samples = int(callback_samples*10)
+    log.debug('Setting output buffer size to %d samples', buffer_samples)
+    mx.DAQmxSetBufOutputBufSize(task, buffer_samples)
+    task._buffer_samples = buffer_samples
 
     result = ctypes.c_uint32()
     mx.DAQmxGetTaskNumChans(task, result)
-    n_channels = result.value
-    log.debug('%d channels in task', n_channels)
+    task._n_channels = result.value
+    log.debug('%d channels in task', task._n_channels)
+
+    # This controls how quickly we can update the buffer on the device. On some
+    # devices it is not user-settable. On the X-series PCIe-6321 I am able to
+    # change it. On the M-xeries PCI 6259 it appears to be fixed at 8191
+    # samples. Haven't really been able to do much about this.
+    mx.DAQmxGetBufOutputOnbrdBufSize(task, result)
+    task._onboard_buffer_size = result.value
+    log.debug('Onboard buffer size %d', task._onboard_buffer_size)
 
     log.debug('Creating callback after every %d samples', callback_samples)
     callback_helper = SamplesGeneratedCallbackHelper(callback)
@@ -764,10 +765,7 @@ class Engine(object):
         task._names = channel_names('ao', lines, names)
         task._fs = fs
         self._tasks['hw_ao'] = task
-
-        mx.DAQmxGetBufOutputBufSize(self._tasks['hw_ao'], self._uint32)
-        self.hw_ao_buffer_samples = self._uint32.value
-        log.info('AO buffer size {} samples'.format(self.hw_ao_buffer_samples))
+        self.hw_ao_buffer_samples = task._buffer_samples
 
     def configure_hw_ai(self, fs, lines, expected_range, names=None,
                         start_trigger=None, terminal_mode=None,
@@ -1081,6 +1079,8 @@ class Engine(object):
         mx.DAQmxGetWriteCurrWritePos(task, self._uint64)
         return self._uint64.value
 
+    # TODO: this is where I "FIX" the extent to which we queue samples in the
+    # buffer.
     def ao_write_space_available(self, offset=None):
         try:
             task = self._tasks['hw_ao']
